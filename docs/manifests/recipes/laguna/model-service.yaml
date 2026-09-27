@@ -1,0 +1,16 @@
+# Name the model, ml-team/laguna, in an OpenAI
+# request to an InferenceGateway that serves it, e.g.:
+#   ADDR=$(kubectl get ig public -o jsonpath='{.status.endpoints.openAI}')
+#   curl "$ADDR/chat/completions" -H 'Content-Type: application/json' \
+#     -d '{"model":"ml-team/laguna","messages":[{"role":"user","content":"hello"}]}'
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelService
+metadata:
+  name: laguna
+  namespace: ml-team
+spec:
+  endpoints:
+  - name: laguna
+    selector:
+      matchLabels:
+        modelplane.ai/deployment: laguna

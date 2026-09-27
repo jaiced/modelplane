@@ -198,11 +198,15 @@ class Candidate:
     # same deployment on the same cluster. Stable across reconciles for a
     # retained replica.
     index: int
-    # The cluster's gateway address. Empty if the cluster is pinned but
-    # currently unavailable (no Ready condition or no gateway address).
-    # Callers should not compose a ModelEndpoint when this is empty -
-    # there is nothing to route traffic to.
-    gateway_address: str = ""
+    # The name this cluster's gateway is addressable by. Empty until the cluster
+    # publishes one (see _gateway_hostname). Callers must not compose a
+    # ModelEndpoint when this is empty, because there is no name to route
+    # traffic to.
+    gateway_hostname: str = ""
+    # The cluster's spec.placement.metadata.labels, projected onto the
+    # ModelReplica and ModelEndpoint composed here. How a self-hosted endpoint
+    # gets its region, so a region-scoped ModelService can select it.
+    placement_labels: dict[str, str] = field(default_factory=dict)
     # Per-engine placement: the pool each member of the replica's engines was
     # assigned and that member's resolved device requests. One entry per engine
     # in deployment order. Always populated for a scheduled replica.
@@ -291,7 +295,7 @@ def compile_engines(deployment: mdv1alpha1.ModelDeployment) -> list[_CompiledEng
     malformed expression.
     """
     engines = []
-    for engine in deployment.spec.engines:
+    for engine in deployment.spec.template.spec.engines:
         copies = int(engine.copies or 1)
         members = [
             _CompiledMember(
@@ -306,16 +310,65 @@ def compile_engines(deployment: mdv1alpha1.ModelDeployment) -> list[_CompiledEng
 
 
 def _cluster_ready(cluster: icv1alpha1.InferenceCluster) -> bool:
-    """Check that the cluster is Ready and has a gateway address.
+    """Check that the cluster is Ready and its gateway is addressable by name.
 
-    A cluster without a Ready=True condition hasn't finished provisioning
-    or has become unavailable. A cluster without a gateway address can't
-    receive routed traffic. Both must be true for the cluster to be
-    schedulable for new placements.
+    A cluster without a Ready=True condition hasn't finished provisioning or has
+    become unavailable. A cluster whose gateway has no hostname can't receive
+    routed traffic: an InferenceGateway addresses a cluster by name, because
+    Envoy AI Gateway only applies per-backend model rewriting, credentials and
+    priority failover when every backend in a route is a hostname.
+
+    The cluster decides when to publish that hostname, and withholds it until
+    traffic to it is mutually authenticated as well as addressable, so this is
+    also what keeps work off a cluster whose gateway isn't serving. See
+    compose-inference-cluster's write_status for the conditions.
     """
-    if not cluster.status or not cluster.status.gateway or not cluster.status.gateway.address:
+    if not cluster.status or not cluster.status.gateway or not cluster.status.gateway.hostname:
         return False
     return any(c.type == "Ready" and c.status == "True" for c in cluster.status.conditions or [])
+
+
+_EFFECT_NO_SCHEDULE = "NoSchedule"
+_EFFECT_NO_EXECUTE = "NoExecute"
+
+
+def _tolerates(toleration: mdv1alpha1.Toleration, taint: icv1alpha1.Taint) -> bool:
+    """Whether a toleration matches a taint, following Kubernetes semantics.
+
+    An empty toleration effect matches any effect; otherwise the effects must be
+    equal. Operator Exists matches any taint with the key (an empty key matches
+    every taint); Equal (the default) matches on key and value.
+    """
+    if toleration.effect and toleration.effect != taint.effect:
+        return False
+    if (toleration.operator or "Equal") == "Exists":
+        return not toleration.key or toleration.key == taint.key
+    return toleration.key == taint.key and (toleration.value or "") == (taint.value or "")
+
+
+def _has_untolerated_taint(
+    cluster: icv1alpha1.InferenceCluster,
+    tolerations: list[mdv1alpha1.Toleration],
+    effects: tuple[str, ...],
+) -> bool:
+    """Whether the cluster carries a taint with one of `effects` that no toleration matches."""
+    return any(
+        taint.effect in effects and not any(_tolerates(t, taint) for t in tolerations)
+        for taint in cluster.spec.taints or []
+    )
+
+
+def _repels_new(cluster: icv1alpha1.InferenceCluster, tolerations: list[mdv1alpha1.Toleration]) -> bool:
+    """Whether an untolerated taint keeps NEW replicas off this cluster.
+
+    Both NoSchedule and NoExecute block new placements.
+    """
+    return _has_untolerated_taint(cluster, tolerations, (_EFFECT_NO_SCHEDULE, _EFFECT_NO_EXECUTE))
+
+
+def _evicts_existing(cluster: icv1alpha1.InferenceCluster, tolerations: list[mdv1alpha1.Toleration]) -> bool:
+    """Whether an untolerated NoExecute taint drains the replicas already here."""
+    return _has_untolerated_taint(cluster, tolerations, (_EFFECT_NO_EXECUTE,))
 
 
 def _device_satisfies(device: icv1alpha1.Device, programs: list[cel.Program]) -> bool:
@@ -566,6 +619,11 @@ def _retain(
         if identity in seen:
             continue
         cluster = clusters_by_name[cluster_name]
+        # A NoExecute taint the deployment doesn't tolerate drains this replica:
+        # drop it from the retained set so the fill phase reschedules it onto a
+        # tolerated cluster (delete-plus-create, like a Kubernetes drain).
+        if _evicts_existing(cluster, deployment.spec.template.spec.tolerations or []):
+            continue
         placements = _retained_placements(r, cluster, engines)
         if placements is None:
             continue
@@ -574,7 +632,8 @@ def _retain(
             Candidate(
                 name=cluster_name,
                 index=identity[1],
-                gateway_address=_gateway_address(cluster),
+                gateway_hostname=_gateway_hostname(cluster),
+                placement_labels=_placement_labels(cluster),
                 engines=placements,
             )
         )
@@ -832,7 +891,8 @@ def _fill(
             Candidate(
                 name=name,
                 index=index,
-                gateway_address=_gateway_address(cluster),
+                gateway_hostname=_gateway_hostname(cluster),
+                placement_labels=_placement_labels(cluster),
                 engines=placements,
             )
         )
@@ -890,11 +950,25 @@ def _lowest_free_index(used: set[int]) -> int:
     return i
 
 
-def _gateway_address(cluster: icv1alpha1.InferenceCluster) -> str:
-    """The cluster's gateway address, or empty when degraded/unset."""
+def _placement_labels(cluster: icv1alpha1.InferenceCluster) -> dict[str, str]:
+    """The cluster's placement labels, or {} when it declares none."""
+    placement = cluster.spec.placement
+    if not placement or not placement.metadata or not placement.metadata.labels:
+        return {}
+    return dict(placement.metadata.labels)
+
+
+def _gateway_hostname(cluster: icv1alpha1.InferenceCluster) -> str:
+    """The name the cluster's gateway is addressable by, or empty when unset.
+
+    Modelplane derives the name and publishes it once the gateway is both
+    addressable and mutually authenticated, so an empty value means one of: no
+    address yet, no CA of its own, or no InferenceGateway CA for it to demand a
+    client certificate against.
+    """
     if not cluster.status or not cluster.status.gateway:
         return ""
-    return cluster.status.gateway.address or ""
+    return cluster.status.gateway.hostname or ""
 
 
 def _scale_down(retained: list[Candidate], desired: int) -> list[Candidate]:
@@ -953,7 +1027,7 @@ def schedule(
     # _retain keeps the first replica seen for a colliding (cluster, index), and
     # _build_ledger charges replicas in iteration order. An unsorted input could
     # otherwise place two equal states differently across reconciles.
-    all_replicas = sorted(all_replicas, key=lambda r: r.metadata.name or "")
+    all_replicas = sorted(all_replicas, key=lambda r: _name(r.metadata))
 
     # Compile every member's nodeSelector selectors once and reuse them
     # across every pool of every cluster. Raises CELCompileError on a malformed
@@ -972,7 +1046,12 @@ def schedule(
         # must not charge our dropped or scaled-down replicas, whose nodes are
         # freeing up. Fill then decrements it only as it places NEW replicas.
         ledger = _build_ledger(deployment, clusters, retained, all_replicas)
-        placed = _fill(engines, clusters, retained, ledger, desired - len(retained))
+        # New replicas avoid clusters carrying an untolerated taint (NoSchedule
+        # or NoExecute). The ledger still spans every cluster, so a tainted
+        # cluster's capacity is accounted for other deployments' replicas.
+        tolerations = deployment.spec.template.spec.tolerations or []
+        schedulable = [c for c in clusters if not _repels_new(c, tolerations)]
+        placed = _fill(engines, schedulable, retained, ledger, desired - len(retained))
 
     result = retained + placed
     result.sort(key=lambda c: (c.name, c.index))

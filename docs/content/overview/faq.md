@@ -27,10 +27,12 @@ Modelplane.
 
 {{< qa "How is Modelplane different from KServe or NVIDIA Dynamo?" >}}
 Scope. KServe and Dynamo are cluster orchestrators: they schedule, scale, route,
-and cache within a single Kubernetes cluster. Modelplane runs its operations across a
-fleet of clusters, clouds, and regions. Modelplane uses llm-d for multi-node serving, 
-and KV-cache management, as do KServe and Dynamo. Modelplane is planning deeper integrations
-with NVIDIA Dynamo in future releases.
+and cache within a single Kubernetes cluster. Modelplane runs those operations
+across a fleet of clusters, clouds, and regions. It uses llm-d for
+inference-aware routing, and installs a per-cluster
+[serving stack]({{< ref "/platform/inference-cluster.md#serving-stack" >}}) that's
+Standard by default or Dynamo, which brings in NVIDIA's Grove, KAI Scheduler, and
+ModelExpress.
 {{< /qa >}}
 
 {{< qa "How is Modelplane different from a managed provider like Baseten or Fireworks?" >}}
@@ -56,7 +58,8 @@ attributes such as GPU memory and architecture with CEL selectors.
 The software stack rides on the engine-agnostic API. NVIDIA NIM microservices and
 the TensorRT-LLM engine run as engine containers like any other, Modelplane stages
 weights and NIM-style artifacts from NVIDIA NGC alongside Hugging Face and other
-registries, and the inference stack it installs includes NVIDIA Dynamo and llm-d,
+registries, and a cluster can run NVIDIA's
+[Dynamo serving stack]({{< ref "/platform/inference-cluster.md#serving-stack" >}}),
 with deeper Dynamo integration on the roadmap.
 {{< /qa >}}
 
@@ -113,7 +116,7 @@ replica on a cluster and pool that fits and has free capacity.
 {{< /qa >}}
 
 {{< qa "Can I serve across regions and clusters behind one endpoint?" >}}
-Yes, that's the point. A `ModelService` exposes one OpenAI-compatible endpoint and
+Yes, that's the point. A `ModelService` gives callers one model name and
 load-balances across every replica of a deployment, wherever they run.
 {{< /qa >}}
 
@@ -124,10 +127,13 @@ replicas, and load-balances across all of them.
 {{< /qa >}}
 
 {{< qa "How do large or multi-node models work?" >}}
-An engine can be a gang: a leader and one or more workers that Modelplane composes
-into a LeaderWorkerSet across nodes. You write the coordination (like Ray or vLLM's data-parallel coordinator) in the engine flags, and Modelplane injects
-the leader's address so the workers can join it. Multi-node deployments stage
-weights through a `ModelCache`.
+An engine can be a gang: a leader and one or more workers serving across nodes.
+How Modelplane composes and schedules the gang depends on the cluster's
+[serving stack]({{< ref "/platform/inference-cluster.md#serving-stack" >}}), a
+LeaderWorkerSet on Standard or a gang-scheduled Grove PodCliqueSet on Dynamo. You
+write the coordination (like Ray or vLLM's data-parallel coordinator) in the
+engine flags; `MODELPLANE_LEADER_ADDRESS` resolves on either stack.
+Multi-node deployments stage weights through a `ModelCache`.
 {{< /qa >}}
 
 {{< qa "What about disaggregated prefill/decode?" >}}

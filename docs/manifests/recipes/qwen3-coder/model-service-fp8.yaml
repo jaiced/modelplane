@@ -1,0 +1,14 @@
+# Exposes the single-node FP8 qwen3-coder-sgl deployment as one model a caller can
+# name. Name the model, ml-team/qwen3-coder-sgl,
+# in a request to an InferenceGateway that serves it.
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelService
+metadata:
+  name: qwen3-coder-sgl
+  namespace: ml-team
+spec:
+  endpoints:
+  - name: qwen3-coder-sgl
+    selector:
+      matchLabels:
+        modelplane.ai/deployment: qwen3-coder-sgl

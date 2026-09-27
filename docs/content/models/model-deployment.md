@@ -15,13 +15,17 @@ its flags, and Modelplane shapes a serving topology around it. The engine flags
 you write carry parallelism, quantization, and KV transfer, never injected by
 Modelplane.
 
-A deployment's `spec.engines` describes its topology through two choices:
+A deployment's replica shape lives under `spec.template` (mirroring a
+Kubernetes Deployment): the replica count is `spec.replicas`, labels for the
+composed ModelReplicas and ModelEndpoints go on `spec.template.metadata.labels`,
+and everything else lives in `spec.template.spec`. Its
+`spec.template.spec.engines` array describes the topology through two choices:
 
 - **One pod or a gang**: whether an engine is a single `Standalone` pod or a
   `Leader` with one or more `Worker` pods coordinating across nodes.
-- **Unified or disaggregated**: whether `spec.serving.mode` keeps prefill and
-  decode together (`Unified`, the default) or splits them across two engines
-  (`PrefillDecode`).
+- **Unified or disaggregated**: whether `spec.template.spec.serving.mode` keeps
+  prefill and decode together (`Unified`, the default) or splits them across two
+  engines (`PrefillDecode`).
 
 How many of each to run is a separate question, covered in
 [Sizing a deployment](#sizing-a-deployment).
@@ -49,8 +53,8 @@ node. The pods serve the model together; how the model splits across them
 (tensor, pipeline, data, or expert parallelism) is up to your engine flags.
 
 A gang should use a [`ModelCache`]({{< ref "model-cache.md" >}}) via
-`spec.modelCacheRef`, so every pod mounts the same weights instead of each
-pulling its own.
+`spec.template.spec.modelCacheRef`, so every pod mounts the same weights instead
+of each pulling its own.
 
 ```yaml {nocopy=true}
 modelCacheRef:
@@ -64,6 +68,16 @@ engines:
       nodes: 1              # one worker pod per node
 ```
 
+Modelplane injects the gang's coordination env, so a worker's command can find
+the leader and its own rank. `$(MODELPLANE_LEADER_ADDRESS)` is the leader's
+address on either [serving stack]({{< ref "/platform/inference-cluster.md#serving-stack" >}}).
+`$(MODELPLANE_RANK)` is the pod's node rank (0 on the leader, `1..N` on the
+workers) on Standard, but isn't injected on Dynamo yet
+([#418](https://github.com/modelplaneai/modelplane/issues/418)). A gang on Dynamo
+derives its rank from Grove's `GROVE_PCLQ_POD_INDEX` instead,
+`$$((GROVE_PCLQ_POD_INDEX + 1))` on the workers (`$$` escapes Kubernetes' own
+expansion, leaving `$((...))` for the shell).
+
 A member's `env` can read pod fields through `valueFrom.fieldRef`, like setting
 vLLM's `VLLM_HOST_IP` from `status.podIP`, which multi-NIC RDMA nodes need so the
 engine binds the right interface instead of guessing it.
@@ -72,10 +86,10 @@ engine binds the right interface instead of guessing it.
 
 The prefill and decode phases have opposite hardware profiles, and on one engine
 a prefill burst stalls the decodes already running. Set
-`spec.serving.mode: PrefillDecode` to run them as two engines, one marking
-`phase: Prefill` and the other `phase: Decode`. Modelplane fronts the pair with
-inference-aware routing that sequences prefill then decode, moving the KV cache
-between them. Each phase can sit on the GPU class that suits it.
+`spec.template.spec.serving.mode: PrefillDecode` to run them as two engines, one
+marking `phase: Prefill` and the other `phase: Decode`. Modelplane fronts the
+pair with inference-aware routing that sequences prefill then decode, moving the
+KV cache between them. Each phase can sit on the GPU class that suits it.
 
 ```yaml {nocopy=true}
 serving:

@@ -1,0 +1,28 @@
+# Crossplane converts every provider CRD into an inactive
+# ManagedResourceDefinition and only creates the CRD once a
+# ManagedResourceActivationPolicy activates it. A provider with the safe-start
+# capability, like the upbound provider families, scales its runtime to zero
+# until one of its definitions is active, so activating a kind is what runs the
+# provider that serves it.
+#
+# This policy activates only provider-helm and provider-kubernetes, which serve
+# every control plane. compose-inference-cluster composes a second, cluster-
+# scoped policy activating just the kinds the cloud it provisions needs, so a
+# control plane runs a cloud's providers only once it has an InferenceCluster on
+# that cloud, rather than all of them from here.
+#
+# It ships in the Configuration package, so it installs with the Modelplane
+# APIs. For it to take effect, install Crossplane with an empty default
+# activation (provider.defaultActivations=[]); see the installation guide. Its
+# default is "*", which activates every CRD and makes on-demand activation a
+# no-op. Activation is one-way: removing an entry from a policy does not
+# deactivate a CRD on a running control plane.
+apiVersion: apiextensions.crossplane.io/v1alpha1
+kind: ManagedResourceActivationPolicy
+metadata:
+  name: modelplane
+spec:
+  activate:
+  # provider-helm and provider-kubernetes (serving stack, gateway, caches).
+  - releases.helm.m.crossplane.io
+  - objects.kubernetes.m.crossplane.io

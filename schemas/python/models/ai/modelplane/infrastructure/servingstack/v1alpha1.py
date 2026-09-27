@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, Field, conint, constr
+from pydantic import AwareDatetime, BaseModel, Field, constr
 
 from .....io.k8s.apimachinery.pkg.apis.meta import v1
 
@@ -41,18 +41,14 @@ class Crossplane(BaseModel):
     resourceRefs: list[ResourceRef] | None = None
 
 
-class Listener(BaseModel):
-    name: constr(min_length=1, max_length=63)
+class ClientCA(BaseModel):
+    certificate: constr(min_length=1, max_length=16384)
     """
-    Unique listener name.
+    The CA certificate, PEM encoded.
     """
-    port: conint(ge=1, le=65535)
+    name: constr(min_length=1, max_length=253)
     """
-    Port number for this listener.
-    """
-    protocol: Literal['HTTP', 'TCP']
-    """
-    Protocol for this listener.
+    The InferenceGateway this CA belongs to.
     """
 
 
@@ -61,9 +57,14 @@ class Gateway(BaseModel):
     """
     GatewayClass name. Override if the cluster already has a GatewayClass named envoy.
     """
-    listeners: list[Listener] | None = Field(None, max_length=8)
+    clientCAs: list[ClientCA] | None = Field(None, max_length=32)
     """
-    Gateway listeners. Defaults to a single HTTP listener on port 80 if not specified.
+    PEM certificates of the CAs whose client certificates this gateway accepts, one per InferenceGateway in the fleet. Projected from the InferenceCluster, which reads them from each gateway's status.
+    The gateway refuses a request without a client certificate signed by one of these.
+    """
+    hostname: constr(min_length=1, max_length=253)
+    """
+    The name this cluster's gateway is reached by, projected from the InferenceCluster. The gateway serves a certificate for it, so an InferenceGateway can originate TLS and know it reached the right cluster.
     """
 
 
@@ -76,63 +77,41 @@ class Secret(BaseModel):
     """
     Name of the Secret.
     """
-    type: Literal['Kubeconfig', 'GCPServiceAccountKey']
+    namespace: constr(max_length=253) | None = None
     """
-    The type of credential this secret contains. Kubeconfig is required. Cloud-specific types are optional and determine how the ProviderConfigs authenticate.
+    Namespace of the Secret, when it isn't this ServingStack's namespace. Set on cloud identity entries whose credential is the Secret the cloud provider's ProviderConfig references.
     """
-
-
-class Versions(BaseModel):
-    certManager: constr(min_length=1, max_length=32) | None = 'v1.17.1'
+    type: Literal[
+        'Kubeconfig',
+        'GoogleApplicationCredentials',
+        'AWSWebIdentityCredentials',
+        'NebiusServiceAccountCredentials',
+    ]
     """
-    cert-manager chart version.
-    """
-    envoyGateway: constr(min_length=1, max_length=32) | None = 'v1.8.1'
-    """
-    Envoy Gateway chart version. Must support InferencePool backend resources (the disaggregated-serving routing path), which requires v1.8.x or newer; older releases lack the Gateway API CRDs (ListenerSet) the AI Gateway needs.
-    """
-    gatewayApi: constr(min_length=1, max_length=32) | None = 'v1.5.1'
-    """
-    Gateway API CRD version.
-    """
-    leaderWorkerSet: constr(min_length=1, max_length=32) | None = 'v0.8.0'
-    """
-    LeaderWorkerSet chart version.
-    """
-    nodeFeatureDiscovery: constr(min_length=1, max_length=32) | None = '0.18.3'
-    """
-    Node Feature Discovery chart version. NFD labels GPU nodes so the NVIDIA DRA driver targets its kubelet plugin to them.
-    """
-    nvidiaDraDriver: constr(min_length=1, max_length=32) | None = '0.4.0'
-    """
-    NVIDIA DRA driver chart version. Publishes GPUs as DRA ResourceSlices and the gpu.nvidia.com DeviceClass that ModelReplica ResourceClaims bind through.
-    """
-    prometheus: constr(min_length=1, max_length=32) | None = '72.6.2'
-    """
-    kube-prometheus-stack chart version.
+    The type of credential this secret contains. Kubeconfig is required. Any other value is a cloud identity type; when present, the serving stack authenticates to the cluster as that identity instead of using the kubeconfig's embedded credentials.
     """
 
 
 class Spec(BaseModel):
+    cloud: Literal['GKE', 'EKS', 'AKS', 'Nebius', 'Vultr', 'Existing']
+    """
+    The cloud the target cluster runs on. Selects the fixed set of components and versions this stack installs there, which is resolved per cloud at build time and changes only with a Modelplane release. Mirrors InferenceCluster.spec.cluster.source; the cluster composition sets it.
+    """
     crossplane: Crossplane | None = None
     """
     Configures how Crossplane will reconcile this composite resource
     """
-    gateway: Gateway | None = None
+    gateway: Gateway
     """
     Configuration for the cluster's inference traffic gateway.
     """
-    nvidiaDriverRoot: constr(max_length=512) | None = '/'
-    """
-    Host path where the NVIDIA driver is installed, passed to the DRA driver as nvidiaDriverRoot. Defaults to / (the upstream default), which suits EKS and self-managed clusters. Set it for platforms that install the driver elsewhere — GKE uses /home/kubernetes/bin/nvidia. A non-default value also makes the serving stack compose a ResourceQuota permitting the DRA driver's system-critical pods, which GKE requires. The cluster composition sets this; the serving stack never inspects its own cloud.
-    """
     secrets: list[Secret] = Field(..., max_length=8, min_length=1)
     """
-    Secrets used to authenticate to the target cluster. Typically sourced from a GKECluster's status.secrets. All secrets must be in the same namespace as this ServingStack. A Kubeconfig secret is required. If a cloud-specific credential secret is present (e.g. GCPServiceAccountKey), the ProviderConfigs will use it for identity-based authentication instead of relying on the kubeconfig's embedded credentials.
+    Secrets used to authenticate to the target cluster. Typically sourced from a GKECluster's status.secrets. Secrets are in the same namespace as this ServingStack unless an entry says otherwise. A Kubeconfig secret is required. If a cloud identity secret is present, the serving stack authenticates as that identity instead of relying on the kubeconfig's embedded credentials.
     """
-    versions: Versions | None = None
+    stack: Literal['Standard', 'Dynamo'] | None = 'Standard'
     """
-    Version pins for each component. Defaults are the latest tested combination. Override individual versions to upgrade components independently.
+    Which serving stack this installs. Standard (the default) is the Modelplane-composed serving layer: a Deployment or LeaderWorkerSet, Gateway API, and the endpoint picker. Dynamo swaps in NVIDIA's components: Grove with the KAI Scheduler for multi-node gang scheduling, and a shared ModelExpress server for weight distribution. Propagated from the InferenceCluster.
     """
 
 
@@ -149,6 +128,10 @@ class GatewayModel(BaseModel):
     address: constr(max_length=256) | None = None
     """
     The gateway's external address, once assigned by the cloud load balancer.
+    """
+    caCertificate: constr(max_length=16384) | None = None
+    """
+    PEM certificate of the CA that signed this gateway's serving certificate. An InferenceGateway validates the gateway's serving certificate against it.
     """
 
 

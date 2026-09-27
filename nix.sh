@@ -128,8 +128,31 @@ if [ -t 1 ]; then
 	INTERACTIVE_FLAGS="-it"
 fi
 
+# Forward registry credentials into the container when DOCKER_CONFIG is set,
+# so 'nix run .#push' can authenticate to the package registry:
+#   DOCKER_CONFIG=/tmp/dockercfg ./nix.sh run .#push -- --tag <tag>
+# DOCKER_CONFIG names a directory containing a Docker config.json.
+DOCKER_CONFIG_FLAGS=""
+if [ -n "${DOCKER_CONFIG:-}" ]; then
+	DOCKER_CONFIG_FLAGS="-v ${DOCKER_CONFIG}:/dockercfg:ro -e DOCKER_CONFIG=/dockercfg"
+fi
+
+# Publish ports from the container to the host so services in the in-container
+# kind cluster can be reached from the local host. The kind cluster runs in the
+# container's Docker-in-Docker daemon, so its ports aren't visible on the host
+# by default. Set NIX_SH_PORTS to a space-separated list of docker -p specs,
+# e.g. NIX_SH_PORTS="8080:8080" to expose a `kubectl port-forward` bound to
+# 0.0.0.0:8080 inside the container.
+PORT_FLAGS=""
+if [ -n "${NIX_SH_PORTS:-}" ]; then
+	for _p in ${NIX_SH_PORTS}; do
+		PORT_FLAGS="${PORT_FLAGS} -p ${_p}"
+	done
+fi
+
 # Run with --privileged for Docker-in-Docker (required for composition tests).
-docker run --rm --privileged --cgroupns=host ${INTERACTIVE_FLAGS} \
+# shellcheck disable=SC2086  # INTERACTIVE_FLAGS, DOCKER_CONFIG_FLAGS, and PORT_FLAGS are intentionally word-split.
+docker run --rm --privileged --cgroupns=host ${INTERACTIVE_FLAGS} ${DOCKER_CONFIG_FLAGS} ${PORT_FLAGS} \
 	-v "$(pwd):/modelplane" \
 	-v "modelplane-nix:/nix" \
 	-w /modelplane \

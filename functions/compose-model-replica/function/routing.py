@@ -14,11 +14,15 @@
 
 """Routing: front a replica's engine workloads with a serving surface.
 
-The workload backends (native, llm-d, dynamo) compose engines only; this layer
+The workload backends (native, llm-d, Grove) compose engines only; this layer
 decorates them with the routing the replica's serving.mode selects. apply picks
 the strategy:
 
-- Unified fronts every engine's serving pods with one Service + HTTPRoute.
+- Unified fronts the serving pods with a GAIE InferencePool + endpoint picker,
+  so requests route by prefix cache and load rather than round-robin. One path
+  whether the replica serves from a single pod or many: the picker is vestigial
+  for one pod, but the alternative is swapping a Service + HTTPRoute for a pool
+  the moment a second pod appears, which would drop in-flight requests.
 - PrefillDecode (disaggregated) role-labels the two phase engines, injects the
   pd-sidecar on decode, and fronts both with a GAIE InferencePool + endpoint
   picker, routed to in place of a Service.
@@ -30,11 +34,20 @@ Engine flags, including --kv-transfer-config for the NixlConnector, are the
 user's; this layer injects none.
 """
 
+import hashlib
+
 from models.ai.modelplane.modelreplica import v1alpha1
 from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
 from models.io.k8s.apimachinery.pkg.apis.meta import v1 as metav1
 
 from function.backends import base
+
+
+def _name(meta: metav1.ObjectMeta | None) -> str:
+    """The object's name, always set on resources read from the API server."""
+    if meta is None or meta.name is None:
+        raise ValueError("metadata.name is unexpectedly absent")
+    return meta.name
 
 
 def _namespace(meta: metav1.ObjectMeta | None) -> str:
@@ -44,8 +57,14 @@ def _namespace(meta: metav1.ObjectMeta | None) -> str:
     return meta.namespace
 
 
-_EPP_IMAGE = "ghcr.io/llm-d/llm-d-inference-scheduler:v0.8.0"
-_SIDECAR_IMAGE = "ghcr.io/llm-d/llm-d-routing-sidecar:v0.8.0"
+_EPP_IMAGE = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
+_SIDECAR_IMAGE = "ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0"
+
+# ConfigMap key and mount-path filename for each strategy's EPP config.
+# ConfigMap key and mount-path filename for the EPP config. One name for both
+# strategies: the ConfigMap is per-replica and carries a single strategy's
+# config, so the mount path never needs to encode which one.
+_EPP_CONFIG_FILE = "epp-config.yaml"
 
 # The pd-sidecar takes ENGINE_PORT (8000), so the decode engine listens here.
 _DECODE_ENGINE_PORT = 8001
@@ -90,7 +109,7 @@ _LABEL_INFERENCE_SERVING = "llm-d.ai/inference-serving"
 # silently degrades (#179). It's derived best-effort from the engine flags via
 # _kv_block_size() (BLOCK_SIZE_TOKENS placeholder), defaulting to vLLM's 16.
 _EPP_CONFIG_TEMPLATE = """\
-apiVersion: inference.networking.x-k8s.io/v1alpha1
+apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
@@ -131,12 +150,49 @@ schedulingProfiles:
     weight: 1
 """
 
+# EndpointPickerConfig for Unified serving: one profile scoring by prefix cache
+# and queue depth, with no prefill/decode split. A single schedulingProfile makes
+# the EPP fall back to its SingleProfileHandler, and prefix-cache-scorer still
+# needs approx-prefix-cache-producer to populate the prefix-match attribute it
+# scores on (see the disaggregated config above for why the producer pins
+# autoTune and blockSizeTokens). prefix-cache-scorer is weighted 2 to
+# queue-scorer's 1: cache locality dominates placement until queue depths
+# diverge, when the queue score breaks the tie. It's a starting default, not a
+# tuned one.
+_UNIFIED_EPP_CONFIG_TEMPLATE = """\
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: approx-prefix-cache-producer
+  parameters:
+    autoTune: false
+    blockSizeTokens: BLOCK_SIZE_TOKENS
+    maxPrefixBlocksToMatch: 256
+    lruCapacityPerServer: 31250
+- type: prefix-cache-scorer
+- type: queue-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+  - pluginRef: queue-scorer
+    weight: 1
+"""
+
 _DEFAULT_KV_BLOCK_SIZE = 16
 
 
-def _epp_config_yaml(block_size: int) -> str:
-    """Render the EPP config with the engine's KV block size."""
+def _disaggregated_epp_config_yaml(block_size: int) -> str:
+    """Render the disaggregated EPP config with the engine's KV block size."""
     return _EPP_CONFIG_TEMPLATE.replace("BLOCK_SIZE_TOKENS", str(block_size))
+
+
+def _unified_epp_config_yaml(block_size: int) -> str:
+    """Render the unified EPP config with the engine's KV block size."""
+    return _UNIFIED_EPP_CONFIG_TEMPLATE.replace("BLOCK_SIZE_TOKENS", str(block_size))
 
 
 def _flag_value(args: list, *flags: str) -> str | None:
@@ -189,8 +245,8 @@ def apply(
 ) -> dict[str, k8sobjv1alpha1.Object]:
     """Decorate the engine workloads with the replica's routing surface.
 
-    PrefillDecode serving picks the disaggregated stack; everything else (Unified
-    or no serving block) picks the plain Service.
+    PrefillDecode serving picks the disaggregated stack; Unified (or no serving
+    block) fronts the serving pods with an InferencePool + endpoint picker.
     """
     serving = replica.spec.serving
     if serving and serving.mode == "PrefillDecode":
@@ -203,8 +259,28 @@ def _unified(
     replica: v1alpha1.ModelReplica,
     provider_config: str,
 ) -> dict[str, k8sobjv1alpha1.Object]:
-    """Front every engine's serving pods with one Service + HTTPRoute."""
-    return {**composed, **base.serving_resources(replica, provider_config)}
+    """Front the replica's serving pods with an InferencePool + endpoint picker.
+
+    Selects the pods by the serving label they already carry, and routes the
+    replica's path at the pool. The picker scores by prefix cache and queue depth
+    (see _UNIFIED_EPP_CONFIG_TEMPLATE) rather than spraying requests round-robin.
+
+    One pod or many, the surface is the same. A single pod has nothing to pick
+    between, so the picker is vestigial there; but always fronting with a pool
+    avoids swapping a Service for one the moment a second pod appears - a swap
+    that would drop in-flight requests.
+    """
+    name = _name(replica.metadata)
+    out = dict(composed)
+    # The prefix-cache producer must chunk prefixes at the engine's KV block
+    # size; derive it from the first engine's flags (HACK, #179).
+    block_size = _kv_block_size(_engine_args(out[base.workload_key(replica.spec.engines[0])]))
+    selector = {base.LABEL_SERVING: base.serving_label(replica)}
+    ns = base.remote_namespace(replica)
+    out["inference-pool"] = base.wrap_object(provider_config, _inference_pool(name, ns, selector))
+    out[base.ROUTE_KEY] = base.wrap_object(provider_config, _http_route(replica, name))
+    out.update(_epp_objects(name, ns, provider_config, _unified_epp_config_yaml(block_size)))
+    return out
 
 
 def _disaggregated(
@@ -226,10 +302,7 @@ def _disaggregated(
     current tag. Engine images are the user's (#137), so Modelplane can't bundle
     this; it is a deployment prerequisite, not something the composition provides.
     """
-    assert (
-        replica.metadata is not None and replica.metadata.name is not None
-    )  # set on resources read from the API server
-    name = replica.metadata.name
+    name = _name(replica.metadata)
     prefill = next(e for e in replica.spec.engines if e.phase == "Prefill")
     decode = next(e for e in replica.spec.engines if e.phase == "Decode")
 
@@ -248,29 +321,49 @@ def _disaggregated(
     # The EPP's prefix-cache producer must chunk prefixes at the decode engine's
     # KV block size; derive it from the decode engine's flags (HACK, #179).
     block_size = _kv_block_size(_engine_args(out[decode_key]))
-    out["inference-pool"] = base.wrap_object(provider_config, _inference_pool(name))
+    # Select the replica's serving pods by the serving label they already carry,
+    # the same as unified. The phase (role) labels _label_role adds are for the
+    # EPP's prefill/decode filters, not for pool membership.
+    selector = {base.LABEL_SERVING: base.serving_label(replica)}
+    ns = base.remote_namespace(replica)
+    out["inference-pool"] = base.wrap_object(provider_config, _inference_pool(name, ns, selector))
     out[base.ROUTE_KEY] = base.wrap_object(provider_config, _http_route(replica, name))
-    out.update(_epp_objects(name, provider_config, block_size))
+    out.update(_epp_objects(name, ns, provider_config, _disaggregated_epp_config_yaml(block_size)))
     return out
 
 
 def _serving_pod_templates(manifest: dict) -> list[dict]:
-    """The pod template(s) of a workload that actually serve the API.
+    """The serving pod target(s) of a workload that actually serve the API.
 
-    A Deployment serves from spec.template; a LeaderWorkerSet serves from its
-    leaderTemplate (followers never serve). Returns the list to mutate.
+    Normalizes the three workload shapes to {"labels": ..., "spec": ...}, a
+    mutable reference to the pod's labels and a mutable reference to its
+    corev1.PodSpec, so callers don't need to know which workload kind they're
+    decorating. A Deployment carries a PodTemplateSpec at spec.template and a
+    LeaderWorkerSet one at spec.leaderWorkerTemplate.leaderTemplate (its
+    followers never serve) - both with labels under metadata. A Grove
+    PodCliqueSet's leader clique (the only clique that serves) is different: its
+    podSpec is a bare corev1.PodSpec with no metadata of its own, so its labels
+    live one level up, on the clique itself.
     """
     spec = manifest["spec"]
-    if manifest["kind"] == "Deployment":
-        return [spec["template"]]
-    return [spec["leaderWorkerTemplate"]["leaderTemplate"]]
+    kind = manifest["kind"]
+    if kind == "Deployment":
+        tmpl = spec["template"]
+        return [{"labels": tmpl.setdefault("metadata", {}).setdefault("labels", {}), "spec": tmpl["spec"]}]
+    if kind == "LeaderWorkerSet":
+        tmpl = spec["leaderWorkerTemplate"]["leaderTemplate"]
+        return [{"labels": tmpl.setdefault("metadata", {}).setdefault("labels", {}), "spec": tmpl["spec"]}]
+    for clique in spec["template"]["cliques"]:
+        if clique["name"] == base.GROVE_LEADER_CLIQUE:
+            return [{"labels": clique.setdefault("labels", {}), "spec": clique["spec"]["podSpec"]}]
+    raise ValueError("PodCliqueSet manifest has no leader clique")
 
 
 def _label_role(obj: k8sobjv1alpha1.Object, *, role: str, app: str) -> None:
     """Stamp the role + InferencePool selector labels on an engine's serving pods."""
     manifest = obj.spec.forProvider.manifest
     for tmpl in _serving_pod_templates(manifest):
-        labels = tmpl.setdefault("metadata", {}).setdefault("labels", {})
+        labels = tmpl["labels"]
         labels[_LABEL_ROLE] = role
         labels[_LABEL_INFERENCE_SERVING] = "true"
         labels["app"] = app
@@ -358,13 +451,13 @@ def _inject_nixl_plumbing(obj: k8sobjv1alpha1.Object) -> None:
             env.append({"name": "VLLM_NIXL_SIDE_CHANNEL_PORT", "value": _NIXL_SIDE_CHANNEL_PORT})
 
 
-def _inference_pool(name: str) -> dict:
+def _inference_pool(name: str, namespace: str, selector: dict[str, str]) -> dict:
     return {
         "apiVersion": "inference.networking.k8s.io/v1",
         "kind": "InferencePool",
-        "metadata": {"name": f"{name}-pool", "namespace": base.REMOTE_NAMESPACE},
+        "metadata": {"name": f"{name}-pool", "namespace": namespace},
         "spec": {
-            "selector": {"matchLabels": {"app": name, _LABEL_INFERENCE_SERVING: "true"}},
+            "selector": {"matchLabels": selector},
             "targetPorts": [{"number": base.ENGINE_PORT}],
             "endpointPickerRef": {"name": f"{name}-epp", "port": {"number": 9002}, "failureMode": "FailOpen"},
         },
@@ -375,9 +468,9 @@ def _http_route(replica: v1alpha1.ModelReplica, name: str) -> dict:
     return {
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "HTTPRoute",
-        "metadata": {"name": name, "namespace": base.REMOTE_NAMESPACE},
+        "metadata": {"name": name, "namespace": base.remote_namespace(replica)},
         "spec": {
-            "parentRefs": [{"name": "inference-gateway", "namespace": "modelplane-system"}],
+            "parentRefs": [{"name": "cluster-gateway", "namespace": "modelplane-system"}],
             "rules": [
                 {
                     "matches": [{"path": {"type": "PathPrefix", "value": f"/{_namespace(replica.metadata)}/{name}/"}}],
@@ -397,13 +490,12 @@ def _http_route(replica: v1alpha1.ModelReplica, name: str) -> dict:
     }
 
 
-def _epp_objects(name: str, provider_config: str, block_size: int) -> dict[str, k8sobjv1alpha1.Object]:
+def _epp_objects(name: str, ns: str, provider_config: str, config_yaml: str) -> dict[str, k8sobjv1alpha1.Object]:
     """The endpoint picker: ServiceAccount, RBAC, ConfigMap, Deployment, Service.
 
-    block_size is the engine's KV block size, rendered into the prefix-cache
-    producer so its prefix chunking matches the engine.
+    config_yaml is the rendered EndpointPickerConfig the picker runs with; it
+    differs by serving strategy.
     """
-    ns = base.REMOTE_NAMESPACE
     epp = f"{name}-epp"
     sa = {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": epp, "namespace": ns}}
     role = {
@@ -437,8 +529,13 @@ def _epp_objects(name: str, provider_config: str, block_size: int) -> dict[str, 
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {"name": epp, "namespace": ns},
-        "data": {"pd-epp-config.yaml": _epp_config_yaml(block_size)},
+        "data": {_EPP_CONFIG_FILE: config_yaml},
     }
+    # The EPP reads its config once at startup and a mounted ConfigMap update
+    # doesn't re-trigger that read, so a config change alone would leave the
+    # picker on the old config. Stamp a hash of the config on the pod template so
+    # a change rolls the Deployment.
+    config_checksum = hashlib.sha256(config_yaml.encode()).hexdigest()
     deployment = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -447,7 +544,10 @@ def _epp_objects(name: str, provider_config: str, block_size: int) -> dict[str, 
             "replicas": 1,
             "selector": {"matchLabels": {"app": epp}},
             "template": {
-                "metadata": {"labels": {"app": epp}},
+                "metadata": {
+                    "labels": {"app": epp},
+                    "annotations": {"modelplane.ai/epp-config-checksum": config_checksum},
+                },
                 "spec": {
                     "serviceAccountName": epp,
                     "containers": [
@@ -458,7 +558,7 @@ def _epp_objects(name: str, provider_config: str, block_size: int) -> dict[str, 
                                 f"--pool-name={name}-pool",
                                 f"--pool-namespace={ns}",
                                 "--pool-group=inference.networking.k8s.io",
-                                "--config-file=/config/pd-epp-config.yaml",
+                                f"--config-file=/config/{_EPP_CONFIG_FILE}",
                                 "--grpc-port=9002",
                             ],
                             "ports": [

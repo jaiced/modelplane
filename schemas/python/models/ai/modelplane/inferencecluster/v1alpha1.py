@@ -10,7 +10,33 @@ from pydantic import AwareDatetime, BaseModel, Field, conint, constr
 from ....io.k8s.apimachinery.pkg.apis.meta import v1
 
 
+class Credentials(BaseModel):
+    name: constr(min_length=1, max_length=253) | None = 'default'
+    type: Literal['ProviderConfig', 'ClusterProviderConfig'] | None = (
+        'ClusterProviderConfig'
+    )
+
+
+class Aks(BaseModel):
+    credentials: Credentials | None = None
+    """
+    Azure ProviderConfig or ClusterProviderConfig used to authenticate to the Azure API. Defaults to the ClusterProviderConfig named default.
+    """
+    kubernetesVersion: str | None = '1.34'
+    """
+    AKS cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (how GPUs bind to pods) is generally available.
+    """
+    location: constr(min_length=1, max_length=32)
+    """
+    Azure region for the cluster (e.g. westeurope, eastus2).
+    """
+
+
 class Eks(BaseModel):
+    credentials: Credentials | None = None
+    """
+    AWS ProviderConfig or ClusterProviderConfig used to authenticate to the AWS API. Defaults to the ClusterProviderConfig named default.
+    """
     kubernetesVersion: str | None = '1.36'
     """
     EKS cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (how GPUs bind to pods) is generally available.
@@ -31,6 +57,17 @@ class Cache(BaseModel):
 class IdentitySecretRef(BaseModel):
     key: constr(min_length=1, max_length=253) | None = 'private_key'
     name: constr(min_length=1, max_length=253)
+    type: (
+        Literal[
+            'GoogleApplicationCredentials',
+            'AWSWebIdentityCredentials',
+            'NebiusServiceAccountCredentials',
+        ]
+        | None
+    ) = 'GoogleApplicationCredentials'
+    """
+    Cloud identity type the credential authenticates as. Must match the cloud the existing cluster runs on. Defaults to GoogleApplicationCredentials.
+    """
 
 
 class SecretRef(BaseModel):
@@ -45,7 +82,7 @@ class Existing(BaseModel):
     """
     identitySecretRef: IdentitySecretRef | None = None
     """
-    Optional reference to a Secret containing cloud provider credentials for IAM-based authentication.
+    Optional reference to a Secret containing cloud provider credentials for IAM-based authentication. The type selects which cloud identity the ProviderConfigs authenticate as, and must match the cloud the existing cluster runs on.
     """
     secretRef: SecretRef
     """
@@ -54,12 +91,45 @@ class Existing(BaseModel):
 
 
 class Gke(BaseModel):
+    credentials: Credentials | None = None
+    """
+    GCP ProviderConfig or ClusterProviderConfig used to authenticate to the GCP API. Defaults to the ClusterProviderConfig named default.
+    """
     kubernetesVersion: str | None = '1.35'
-    project: constr(min_length=6, max_length=30)
     region: constr(min_length=1, max_length=32)
 
 
+class Nebius(BaseModel):
+    credentials: Credentials | None = None
+    """
+    Nebius ProviderConfig or ClusterProviderConfig used to authenticate to the Nebius API. Defaults to the ClusterProviderConfig named default.
+    """
+    kubernetesVersion: str | None = '1.34'
+    """
+    mk8s cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (DRA) is generally available.
+    """
+
+
+class Vultr(BaseModel):
+    credentials: Credentials | None = None
+    """
+    Vultr ProviderConfig or ClusterProviderConfig used to authenticate to the Vultr API. Defaults to the ClusterProviderConfig named default.
+    """
+    kubernetesVersion: str | None = 'v1.36.2+1'
+    """
+    VKE cluster Kubernetes version. VKE requires an exact version string including the build suffix; list current versions with vultr-cli kubernetes versions. Defaults to a version where Dynamic Resource Allocation (how GPUs bind to pods) is generally available.
+    """
+    region: constr(min_length=1, max_length=32)
+    """
+    Vultr region for the cluster (e.g. ewr, fra). GPU plans and Vultr File System availability vary by region.
+    """
+
+
 class Cluster(BaseModel):
+    aks: Aks | None = None
+    """
+    AKS cluster configuration. Required when source is AKS.
+    """
     eks: Eks | None = None
     """
     EKS cluster configuration. Required when source is EKS.
@@ -72,9 +142,17 @@ class Cluster(BaseModel):
     """
     GKE cluster configuration. Required when source is GKE.
     """
-    source: Literal['GKE', 'EKS', 'Existing']
+    nebius: Nebius | None = None
+    """
+    Nebius mk8s cluster configuration. Required when source is Nebius; may be empty, since every field has a default. The cluster is created in the project the referenced ProviderConfig or ClusterProviderConfig sets as its projectID; Nebius projects are bound to a region, so the project also determines where the cluster runs.
+    """
+    source: Literal['GKE', 'EKS', 'AKS', 'Nebius', 'Vultr', 'Existing']
     """
     Cluster provisioning method.
+    """
+    vultr: Vultr | None = None
+    """
+    Vultr Kubernetes Engine (VKE) cluster configuration. Required when source is Vultr.
     """
 
 
@@ -119,6 +197,24 @@ class CapacityBlock(BaseModel):
     """
 
 
+class Infiniband(BaseModel):
+    fabric: constr(min_length=1, max_length=63)
+    """
+    Identifier of the physical InfiniBand fabric to join (e.g. fabric-2). This selects existing Nebius infrastructure, not a name for a new resource: fabrics are per-region - see https://docs.nebius.com/compute/clusters/gpu#fabrics - and multi-node GPU capacity is allocated on specific fabrics, so use the fabric your capacity lives on.
+    """
+
+
+class Fabric(BaseModel):
+    infiniband: Infiniband | None = None
+    """
+    InfiniBand fabric configuration. Required when type is InfiniBand and the cluster source is Nebius; not used on AKS.
+    """
+    type: Literal['None', 'EFA', 'InfiniBand'] | None = 'None'
+    """
+    Fabric technology. None uses standard VPC networking (TCP). EFA attaches Elastic Fabric Adapter interfaces to each node for GPUDirect RDMA across nodes; EKS only, and only useful on EFA-capable instance types (e.g. p5en.48xlarge). When any pool sets EFA, Modelplane installs the EFA DRA driver on the cluster and the gang's pods claim EFA devices alongside their GPUs. InfiniBand places the pool's nodes on a physical InfiniBand fabric for GPUDirect RDMA across nodes; Nebius and AKS only, and only useful on InfiniBand-capable shapes (e.g. gpu-h100-sxm on Nebius, Standard_ND96isr_H100_v5 on AKS). On Nebius the pool joins the fabric named in infiniband.fabric; on AKS the pool's VM Scale Set placement group lands its nodes on one fabric, and Modelplane installs the NVIDIA network operator on the cluster.
+    """
+
+
 class NodePool(BaseModel):
     capacityBlock: CapacityBlock | None = None
     """
@@ -128,9 +224,9 @@ class NodePool(BaseModel):
     """
     Name of the InferenceClass describing this pool's hardware.
     """
-    fabric: Literal['None', 'EFA'] | None = 'None'
+    fabric: Fabric | None = None
     """
-    High-performance node-to-node fabric for multi-node engines. None uses standard VPC networking (ENA/TCP). EFA attaches Elastic Fabric Adapter interfaces to each node for GPUDirect RDMA across nodes, so a gang's tensor-parallel traffic isn't capped by TCP. EKS only. Only useful on EFA-capable instance types (e.g. p5en.48xlarge). When any pool sets EFA, Modelplane installs the EFA DRA driver on the cluster and the gang's pods claim EFA devices alongside their GPUs.
+    High-performance node-to-node fabric for multi-node engines, so a gang's tensor-parallel traffic isn't capped by TCP. Omit for standard VPC networking.
     """
     maxNodeCount: conint(ge=1) | None = None
     """
@@ -145,6 +241,27 @@ class NodePool(BaseModel):
     """
 
 
+class Metadata(BaseModel):
+    labels: dict[str, constr(max_length=63)] | None = Field(None, max_length=16)
+    """
+    Labels stamped onto every ModelReplica and ModelEndpoint composed on this cluster.
+    This is how a self-hosted endpoint gets its region: a ModelService selects endpoints by label, so a service scoped to a region selects only the endpoints in it. These are your labels, under your own prefix.
+    """
+
+
+class Placement(BaseModel):
+    metadata: Metadata | None = None
+    """
+    Metadata to project.
+    """
+
+
+class Taint(BaseModel):
+    effect: Literal['NoSchedule', 'NoExecute']
+    key: constr(min_length=1)
+    value: str | None = None
+
+
 class Spec(BaseModel):
     cluster: Cluster
     crossplane: Crossplane | None = None
@@ -154,6 +271,18 @@ class Spec(BaseModel):
     nodePools: list[NodePool] | None = Field(None, max_length=8, min_length=1)
     """
     GPU node pools available on this cluster. Each pool references an InferenceClass that describes the hardware shape and (for provisioned clusters) how to create the pool. System pools for control-plane components are provisioned automatically.
+    """
+    placement: Placement | None = None
+    """
+    Facts about where this cluster is, projected onto everything Modelplane composes here.
+    """
+    stack: Literal['Standard', 'Dynamo'] | None = 'Standard'
+    """
+    Which serving stack the cluster installs and composes. Standard (the default) is the Modelplane-composed serving layer: a Deployment or LeaderWorkerSet, Gateway API, and the endpoint picker. Dynamo swaps in NVIDIA's components: Grove with the KAI Scheduler gang-schedules multi-node engines, and ModelExpress distributes weights. A single-node (Standalone) engine's workload kind is unaffected - it stays a Deployment - but if it references a ModelCache on a Dynamo cluster it still gets the ModelExpress P2P env and IPC_LOCK, so it can seed peers and load from them like a gang.
+    """
+    taints: list[Taint] | None = None
+    """
+    Taints that repel ModelDeployments from this cluster unless they carry a matching toleration, following the Kubernetes taint model. NoSchedule keeps new replicas off the cluster while leaving existing ones in place; NoExecute additionally drains the replicas already here, which the scheduler reschedules onto other tolerated clusters (the declarative equivalent of draining a node before maintenance).
     """
 
 
@@ -176,7 +305,15 @@ class Condition(BaseModel):
 class Gateway(BaseModel):
     address: str | None = None
     """
-    External IP of the inference gateway on the remote cluster. Used by ModelDeployment for unified endpoint routing.
+    The gateway's external address, an IP or a load balancer's own DNS name.
+    """
+    caCertificate: constr(max_length=16384) | None = None
+    """
+    PEM certificate of the CA that signed the gateway's serving certificate. An InferenceGateway validates the gateway's serving certificate against it. Written once cert-manager on the cluster has issued.
+    """
+    hostname: str | None = None
+    """
+    The stable internal name an InferenceGateway addresses the gateway by, derived by Modelplane. Each InferenceGateway resolves it to address with a Service on its own cluster; it is also the gateway's TLS SNI and certificate SAN. ModelDeployment builds a ModelEndpoint origin from it. Set once the gateway has an address and both directions are mutually authenticated, and withheld otherwise.
     """
 
 
@@ -233,6 +370,9 @@ class Status(BaseModel):
     Conditions of the resource.
     """
     gateway: Gateway | None = None
+    """
+    This cluster's own gateway: the Envoy gateway the serving stack runs at the cluster's edge, which an InferenceGateway routes to. These fields are how an InferenceGateway reaches it.
+    """
     gpuPools: list[GpuPool] | None = Field(None, max_length=8)
     """
     Schedulable GPU node pools on this cluster, derived from the referenced classes and the per-pool node counts. ModelDeployment scheduling matches against these.

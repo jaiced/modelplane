@@ -1,0 +1,15 @@
+# Exposes the qwen-72b deployment as one model a caller can name. Modelplane
+# labels each composed ModelEndpoint with the deployment name, so this selector
+# reaches every replica. Name the model,
+# ml-team/qwen-72b, in a request to an InferenceGateway that serves it.
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelService
+metadata:
+  name: qwen-72b
+  namespace: ml-team
+spec:
+  endpoints:
+  - name: qwen-72b
+    selector:
+      matchLabels:
+        modelplane.ai/deployment: qwen-72b

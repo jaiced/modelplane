@@ -22,43 +22,17 @@ release from it and run the workflow against the new tag.
 
 ## Versioning the docs
 
-Docs are versioned at the minor level. Each minor release is served from its own
-subdomain (`v0-1.docs.modelplane.ai`, `v0-2.docs.modelplane.ai`, …) using a single
-Vercel project with one branch domain per release. The `main` branch always serves
-the latest docs at `docs.modelplane.ai`. Patch releases push to the existing release
-branch and need no changes to `main`.
+Docs are versioned at the minor level, and the versions are this repo's own
+`release-X.Y` branches: whatever is on `release-0.2` is what the 0.2 docs say.
+Cutting that branch in step 1 above is this repo's whole part in publishing a
+version.
 
-One-time DNS setup (already done): a wildcard CNAME `*.docs.modelplane.ai →
-cname.vercel-dns.com` covers every future release subdomain automatically. No new
-DNS record is needed per release.
+The rest happens in the docs site repo,
+[docs-site](https://github.com/modelplaneai/docs-site). It builds every version
+from its own `main` into one deployment — the latest release at the root, older
+releases under `/vX.Y/`, and this repo's `main` under `/main/` — and it is the
+one place that decides which release is latest. Publishing a new version is one
+entry added to its version list; see that repo's README.
 
-To publish docs for a new minor release (e.g. `v0.1.0`):
-
-1. On `release-0.1`, set `version = "0.1"` in `docs/hugo.toml`. Leave
-   `latest = "main"` unchanged — the latest docs always live at the root.
-
-2. In the Vercel dashboard, open the `modelplane-docs` project and add a branch
-   domain for the release:
-   - Go to Settings → Domains, add `v0-1.docs.modelplane.ai`, and assign it
-     to the `release-0.1` branch.
-   - Add a Production environment variable scoped to the `release-0.1` branch:
-     `HUGO_BASEURL` = `https://v0-1.docs.modelplane.ai/`.
-   - Trigger a redeployment of `release-0.1` and confirm the subdomain serves.
-
-3. On `main`, add an entry to `docs/data/versions.yaml`, newest first:
-   ```yaml
-   versions:
-     - version: "main"
-       url: ""
-     - version: "0.1"
-       url: "https://v0-1.docs.modelplane.ai"
-   ```
-
-4. Merge the `versions.yaml` change to `main`. The version dropdown on all release
-   builds now links to the new subdomain.
-
-To fix a typo or update content in an archived version, push to the release branch.
-The versioned deployment rebuilds automatically.
-
-When a new minor ships (e.g. `v0.2.0`), repeat steps 1–4 for `release-0.2`,
-adding the `v0.2` entry above `v0.1` in `versions.yaml`.
+To fix a typo in a released version, push the fix to that `release-X.Y` branch
+here.

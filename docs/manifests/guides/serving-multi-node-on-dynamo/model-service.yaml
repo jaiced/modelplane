@@ -1,0 +1,15 @@
+# Exposes the gang as one model a caller can name. Modelplane composes one
+# ModelEndpoint per replica, labeled modelplane.ai/deployment: qwen2-5-14b, so
+# this selector reaches it. Name the model,
+# ml-team/qwen2-5-14b, in a request to an InferenceGateway that serves it.
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelService
+metadata:
+  name: qwen2-5-14b
+  namespace: ml-team
+spec:
+  endpoints:
+  - name: qwen2-5-14b
+    selector:
+      matchLabels:
+        modelplane.ai/deployment: qwen2-5-14b

@@ -12,8 +12,7 @@ A provider can show up here in three ways:
 
 {{< hint "note" >}}
 - **Provisioning supported.** Modelplane creates and manages the whole cluster
-  from an `InferenceCluster`, selected through `provisioning.provider`. GKE and
-  EKS work this way today.
+  from an `InferenceCluster`, selected through `provisioning.provider`. GKE, EKS, AKS, Nebius mk8s, Vultr VKE work this way today.
 - **Bring your own supported.** Register a cluster you already run with
   `source: Existing`. This works on any provider whose Kubernetes meets
   Modelplane's requirements (Dynamic Resource Allocation and a recent Kubernetes
@@ -46,14 +45,14 @@ native provisioning.
 | IBM Cloud (IKS) | {{< accel nvidia >}} | Planned | ✓ | none active |
 | Lambda | {{< accel nvidia >}} | Planned | ✓ | none yet |
 | Linode / Akamai (LKE) | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/linode/provider-linode" "provider-linode" "official" >}} |
-| Microsoft Azure (AKS) | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/crossplane-contrib/provider-upjet-azure" "provider-upjet-azure" "community" >}} |
-| Nebius | {{< accel nvidia >}} | Planned | ✓ | none yet |
+| Microsoft Azure (AKS) | {{< accel nvidia >}} | ✓ | ✓ | {{< repolink "https://github.com/crossplane-contrib/provider-upjet-azure" "provider-upjet-azure" "community" >}} |
+| Nebius (mk8s) | {{< accel nvidia >}} | ✓ | ✓ | {{< repolink "https://github.com/upbound/provider-upjet-nebius" "provider-upjet-nebius" "official" >}} |
 | Oracle Cloud (OKE) | {{< accel nvidia >}} {{< accel amd >}} | Planned | ✓ | {{< repolink "https://github.com/oracle/crossplane-provider-oci" "crossplane-provider-oci" "official" >}} |
 | OVHcloud | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/edixos/provider-ovh" "edixos/provider-ovh" "community" >}} |
 | Scaleway (Kapsule) | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/scaleway/crossplane-provider-scaleway" "crossplane-provider-scaleway" "official" >}} |
 | Tencent Cloud (TKE) | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/crossplane-contrib/provider-tencentcloud" "provider-tencentcloud" "community" >}} |
 | Voltage Park | {{< accel nvidia >}} | Planned | ✓ | none yet |
-| Vultr (VKE) | {{< accel nvidia >}} {{< accel amd >}} | Planned | ✓ | {{< repolink "https://github.com/vultr/crossplane-provider-vultr" "crossplane-provider-vultr" "official" >}} |
+| Vultr (VKE) | {{< accel nvidia >}} {{< accel amd >}} | ✓ | ✓ | {{< repolink "https://github.com/upbound/provider-vultr" "provider-vultr" "community" >}} |
 {{< /table >}}
 
 {{< hint "note" >}}

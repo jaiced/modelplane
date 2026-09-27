@@ -1,0 +1,45 @@
+apiVersion: modelplane.ai/v1alpha1
+kind: InferenceClass
+metadata:
+  name: l40s-1x
+spec:
+  description: "Nebius gpu-l40s-a, 1x NVIDIA L40S 48GB"
+  provisioning:
+    provider: Nebius
+    nebius:
+      # gpu-l40s-a (L40S PCIe, Intel Ice Lake) is available in eu-north1.
+      platform: gpu-l40s-a
+      preset: 1gpu-8vcpu-32gb
+      diskSizeGb: 100
+      driversPreset: cuda13.0
+      accelerator:
+        type: nvidia-l40s
+        count: 1
+  devices:
+  - name: gpu
+    claim: DRA
+    driver: gpu.nvidia.com
+    deviceClassName: gpu.nvidia.com
+    count: 1
+    attributes:
+      architecture: { string: Ada Lovelace }
+      cudaComputeCapability: { version: "8.9.0" }
+    capacity:
+      memory: { value: "46068Mi" }   # L40S reported VRAM (48GB nominal)
+---
+apiVersion: modelplane.ai/v1alpha1
+kind: InferenceCluster
+metadata:
+  name: nebius-eu-north
+  labels:
+    modelplane.ai/region: eu-north
+spec:
+  cluster:
+    source: Nebius
+    nebius: {}
+  nodePools:
+  - name: gpu-l40s
+    className: l40s-1x
+    nodeCount: 1
+    minNodeCount: 1
+    maxNodeCount: 1

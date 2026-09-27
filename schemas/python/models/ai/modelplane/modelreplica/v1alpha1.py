@@ -65,8 +65,8 @@ class DeviceRequest(BaseModel):
 
 
 class Metadata(BaseModel):
-    annotations: dict[str, str] | None = None
-    labels: dict[str, str] | None = None
+    annotations: dict[str, constr(max_length=8192)] | None = Field(None, max_length=32)
+    labels: dict[str, constr(max_length=63)] | None = Field(None, max_length=32)
 
 
 class ConfigMapKeyRef(BaseModel):

@@ -7,9 +7,10 @@ description: Stage model weights on cluster storage before serving.
 **API:** [`modelplane.ai/v1alpha1` · ModelCache]({{< ref "/reference/modelcaches" >}})
 
 A `ModelCache` stages a model's weights on shared workload-cluster storage,
-fetched once from the configured source rather than downloaded again on every pod
-start. `ModelDeployments` reference a cache via `spec.modelCacheRef.name`, and
-Modelplane mounts it at `/mnt/models` in every serving pod, shared across the
+fetched once from the configured source rather than downloaded again on every
+pod start. `ModelDeployments` reference a cache via
+`spec.template.spec.modelCacheRef.name`, and Modelplane mounts it at
+`/mnt/models` in every serving pod, shared across the
 pods of a multi-node engine. The engine reads weights locally from the mount.
 
 `ModelCache` is recommended for multi-node deployments and optional for
@@ -24,8 +25,18 @@ carries the `repo` to fetch, an optional `revision` (branch, tag, or commit), an
 model, since a value below the model's size leaves no room to stage the weights.
 `HuggingFace` is the only source today.
 
-The cache mounts at `/mnt/models` on every consuming pod, so the engine's args
-reference that path (`--model=/mnt/models` for vLLM) rather than the source.
+The engine's args name the model the same way with or without a cache. A
+`HuggingFace` source stages into HuggingFace's own cache layout on the mount, and
+Modelplane sets `HF_HUB_CACHE` on every consuming pod, so `--model=<repo>`
+resolves to the staged weights instead of pulling them. Adding or removing a
+cache doesn't change the engine command. Modelplane never injects `--model`
+itself: naming the model belongs to the engine command, like every other flag.
+
+Name the same `revision` the cache staged. A bare repository ID resolves at the
+default branch, which finds a cache staged without a `revision` or with
+`revision: main`. A cache pinned to a commit or tag needs the engine to pass that
+revision too (`--revision` for vLLM). An engine that asks for the default branch
+finds nothing staged under it, and downloads the model a second time.
 
 ## Authenticating
 
@@ -81,29 +92,54 @@ minutes for a large model), tuned further with `--model-loader-extra-config`:
 
 ```yaml {nocopy=true}
 args:
-- --model=/mnt/models
+- --model=RedHatAI/Kimi-K2-Instruct-quantized.w4a16
 - --load-format=runai_streamer
 - --model-loader-extra-config={"concurrency":16,"distributed":true}
 ```
 
 The right loader and settings depend on the engine and the storage backend, so
 treat these as a starting point and measure your own cold-start time. The
-[Kimi-K2 example]({{< ref "/examples/kimi-k2" >}}) uses this configuration end to
+[Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) uses this configuration end to
 end.
+
+## Accelerating with ModelExpress
+
+A cache's weights always live on its own PVC, portable across every cluster. On a
+[Dynamo cluster]({{< ref "/platform/inference-cluster.md#serving-stack" >}}) the
+serving stack also runs a
+[ModelExpress](https://github.com/ai-dynamo/modelexpress) server, and
+Modelplane injects ModelExpress env into every engine pod that references a
+cache. An engine opts in with `--load-format modelexpress`: the first replica
+loads from its PVC seed and publishes itself as a source, and later replicas pull
+from a peer over RDMA rather than reading storage again. A replica that finds no
+compatible peer, or no fabric to reach one over, falls back to the PVC, so the
+cache still has to be sized and kept for every replica. The env is inert unless
+the engine opts in, so a cache still works unchanged on a Standard cluster and a
+deployment is portable between the two.
+
+Modelplane injects no `--load-format` flag: the ML team's engine command decides
+whether to use ModelExpress's loader, the same as it decides
+`--load-format=runai_streamer` above. Write it yourself, verbatim:
+
+```yaml {nocopy=true}
+command: ["/bin/sh", "-c"]
+args:
+- >-
+  pip install --index-url https://pypi.nvidia.com modelexpress &&
+  exec vllm serve Qwen/Qwen2.5-7B-Instruct --load-format modelexpress
+```
 
 ## Storage prerequisites
 
 <!-- vale Google.Acronyms = NO -->
 The cache PVC needs a `ReadWriteMany` (RWX) StorageClass on the workload cluster.
-What the platform admin must set up depends on the cloud:
+Some cluster sources provide one automatically; on others the platform admin
+sets one up. See [Register a Cluster]({{< ref "/platform/inference-cluster.md#cache-storage" >}})
+for what each source provides and how to bring your own backend.
 <!-- vale Google.Acronyms = YES -->
 
-- **GKE** and **EKS:** auto-provisioned. Nothing for the admin to do.
-- **Existing:** the admin sets up a `ReadWriteMany` StorageClass on the cluster.
-
-Either way, your `ModelCache` and `ModelDeployment` specs are the same. How
-storage is provided on each cluster source, and how to bring your own backend, is
-covered in [Register a Cluster]({{< ref "/platform/inference-cluster.md#cache-storage" >}}).
+Your `ModelCache` and `ModelDeployment` specs are the same on every cluster
+source.
 
 ## Example
 

@@ -94,12 +94,32 @@ class Accelerator(BaseModel):
     count: conint(ge=1, le=16)
     type: constr(min_length=1, max_length=63)
     """
+    GPU accelerator type (e.g. nvidia-a100, nvidia-h100). Informational - reported on the consuming InferenceCluster's status.
+    """
+
+
+class Aks(BaseModel):
+    accelerator: Accelerator
+    """
+    GPU accelerator to attach when provisioning the node pool. Provisioning input only: the scheduler matches against spec.devices, not this block.
+    """
+    diskSizeGb: conint(ge=10) | None = 100
+    vmSize: constr(min_length=1)
+    """
+    Azure VM size (e.g. Standard_NC24ads_A100_v4, Standard_ND96isr_H100_v5). The VM size determines the GPU model and count; the accelerator block below is informational.
+    """
+
+
+class AcceleratorModel(BaseModel):
+    count: conint(ge=1, le=16)
+    type: constr(min_length=1, max_length=63)
+    """
     GPU accelerator type (e.g. nvidia-a10g, nvidia-h100). Informational - reported on the consuming InferenceCluster's status.
     """
 
 
 class Eks(BaseModel):
-    accelerator: Accelerator
+    accelerator: AcceleratorModel
     """
     GPU accelerator to attach when provisioning the node group. Provisioning input only: the scheduler matches against spec.devices, not this block.
     """
@@ -110,7 +130,7 @@ class Eks(BaseModel):
     """
 
 
-class AcceleratorModel(BaseModel):
+class AcceleratorModel1(BaseModel):
     count: conint(ge=1, le=16)
     type: constr(min_length=1, max_length=63)
     """
@@ -119,7 +139,7 @@ class AcceleratorModel(BaseModel):
 
 
 class Gke(BaseModel):
-    accelerator: AcceleratorModel
+    accelerator: AcceleratorModel1
     """
     GPU accelerator to attach when provisioning the node pool. Provisioning input only: the scheduler matches against spec.devices, not this block, so count here is the GCP machine's GPU count and need not be restated in devices.
     """
@@ -127,10 +147,60 @@ class Gke(BaseModel):
     machineType: constr(min_length=1)
 
 
+class AcceleratorModel2(BaseModel):
+    count: conint(ge=1, le=16)
+    type: constr(min_length=1, max_length=63)
+    """
+    GPU accelerator type (e.g. nvidia-h100, nvidia-l40s). Informational - reported on the consuming InferenceCluster's status.
+    """
+
+
+class Nebius(BaseModel):
+    accelerator: AcceleratorModel2
+    """
+    GPU accelerator to attach when provisioning the node group. Provisioning input only: the scheduler matches against spec.devices, not this block.
+    """
+    diskSizeGb: conint(ge=10) | None = 100
+    driversPreset: constr(min_length=1, max_length=63) | None = 'cuda13.0'
+    """
+    NVIDIA driver stack mk8s preinstalls on the pool's nodes (e.g. cuda12.4, cuda13.0). Valid values depend on the platform and Kubernetes version, and mk8s validates them, so new presets work without a Modelplane update. Defaults to the only preset mk8s implements on the default Kubernetes version; older presets remain for older versions.
+    """
+    platform: constr(min_length=1, max_length=63)
+    """
+    Nebius compute platform (e.g. gpu-h100-sxm, gpu-l40s-a). Together with preset this determines the GPU model and count; the accelerator block below is informational.
+    """
+    preset: constr(min_length=1, max_length=63)
+    """
+    Resource preset within the platform (e.g. 8gpu-128vcpu-1600gb). Determines the GPU, vCPU, and memory shape of each node.
+    """
+
+
+class AcceleratorModel3(BaseModel):
+    count: conint(ge=1, le=16)
+    type: constr(min_length=1, max_length=63)
+    """
+    GPU accelerator type (e.g. nvidia-l40s, nvidia-a100). Informational - reported on the consuming InferenceCluster's status.
+    """
+
+
+class Vultr(BaseModel):
+    accelerator: AcceleratorModel3
+    """
+    GPU accelerator to attach when provisioning the node pool. Provisioning input only: the scheduler matches against spec.devices, not this block.
+    """
+    plan: constr(min_length=1, max_length=63)
+    """
+    Vultr plan ID (e.g. vcg-l40s-16c-180g-48vram). The plan determines the GPU model and count; the accelerator block below is informational.
+    """
+
+
 class Provisioning(BaseModel):
+    aks: Aks | None = None
     eks: Eks | None = None
     gke: Gke | None = None
-    provider: Literal['GKE', 'EKS']
+    nebius: Nebius | None = None
+    provider: Literal['GKE', 'EKS', 'AKS', 'Nebius', 'Vultr']
+    vultr: Vultr | None = None
 
 
 class Spec(BaseModel):

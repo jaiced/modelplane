@@ -17,6 +17,10 @@ spec:
   functions:
   - source: Tarball
     tarball:
+      name: compose-aks-cluster
+      pathPrefix: _output/functions/compose-aks-cluster
+  - source: Tarball
+    tarball:
       name: compose-eks-cluster
       pathPrefix: _output/functions/compose-eks-cluster
   - source: Tarball
@@ -31,6 +35,10 @@ spec:
     tarball:
       name: compose-inference-cluster
       pathPrefix: _output/functions/compose-inference-cluster
+  - source: Tarball
+    tarball:
+      name: compose-nebius-cluster
+      pathPrefix: _output/functions/compose-nebius-cluster
   - source: Tarball
     tarball:
       name: compose-inference-gateway
@@ -57,12 +65,20 @@ spec:
       pathPrefix: _output/functions/compose-model-replica
   - source: Tarball
     tarball:
+      name: compose-model-route
+      pathPrefix: _output/functions/compose-model-route
+  - source: Tarball
+    tarball:
       name: compose-model-service
       pathPrefix: _output/functions/compose-model-service
   - source: Tarball
     tarball:
       name: compose-usages
       pathPrefix: _output/functions/compose-usages
+  - source: Tarball
+    tarball:
+      name: compose-vultr-cluster
+      pathPrefix: _output/functions/compose-vultr-cluster
   dependencies:
   - type: crd
     git:
@@ -116,10 +132,34 @@ spec:
       apiVersion: pkg.crossplane.io/v1
       kind: Provider
       package: xpkg.upbound.io/upbound/provider-helm
-      version: v1.2.0
+      version: v1.4.0
   - type: xpkg
     xpkg:
       apiVersion: pkg.crossplane.io/v1
       kind: Provider
       package: xpkg.upbound.io/upbound/provider-kubernetes
-      version: v1.2.1
+      version: v1.3.0
+  - type: xpkg
+    xpkg:
+      apiVersion: pkg.crossplane.io/v1
+      kind: Provider
+      package: xpkg.upbound.io/upbound/provider-nebius
+      version: v1.0.1
+  - type: xpkg
+    xpkg:
+      apiVersion: pkg.crossplane.io/v1
+      kind: Provider
+      package: xpkg.upbound.io/upbound/provider-azure-containerservice
+      version: v2.6.0
+  - type: xpkg
+    xpkg:
+      apiVersion: pkg.crossplane.io/v1
+      kind: Provider
+      package: xpkg.upbound.io/upbound/provider-azure-network
+      version: v2.6.0
+  - type: xpkg
+    xpkg:
+      apiVersion: pkg.crossplane.io/v1
+      kind: Provider
+      package: xpkg.upbound.io/upbound/provider-vultr
+      version: v1.0.0

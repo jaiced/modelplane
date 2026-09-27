@@ -8,6 +8,7 @@ spec:
     categories:
     - crossplane
     - modelplane
+    - infrastructure
     kind: GKECluster
     plural: gkeclusters
     shortNames:
@@ -17,9 +18,6 @@ spec:
   - name: v1alpha1
     referenceable: true
     additionalPrinterColumns:
-    - name: PROJECT
-      type: string
-      jsonPath: .spec.project
     - name: REGION
       type: string
       jsonPath: .spec.region
@@ -34,15 +32,9 @@ spec:
           spec:
             description: GKEClusterSpec defines the desired state of GKECluster.
             required:
-            - project
             - region
             - nodePools
             properties:
-              project:
-                type: string
-                description: GCP project ID where the cluster will be created.
-                maxLength: 30
-                minLength: 6
               region:
                 type: string
                 description: >-
@@ -57,6 +49,24 @@ spec:
                   by the REGULAR release channel.
                 minLength: 1
                 maxLength: 16
+              credentials:
+                type: object
+                description: >-
+                  GCP ProviderConfig or ClusterProviderConfig used to
+                  authenticate to the GCP API. Defaults to the
+                  ClusterProviderConfig named default.
+                properties:
+                  type:
+                    type: string
+                    default: ClusterProviderConfig
+                    enum:
+                    - ProviderConfig
+                    - ClusterProviderConfig
+                  name:
+                    type: string
+                    default: default
+                    minLength: 1
+                    maxLength: 253
               networking:
                 type: object
                 description: >-
@@ -206,12 +216,12 @@ spec:
                       description: >-
                         The type of credential this secret contains.
                         Kubeconfig contains a kubeconfig file with the cluster
-                        endpoint and CA certificate. GCPServiceAccountKey
-                        contains a GCP service account JSON key that can
-                        authenticate to the cluster via GKE IAM.
+                        endpoint and CA certificate. GoogleApplicationCredentials
+                        contains a GCP service account JSON key that
+                        authenticates to the cluster via GKE IAM.
                       enum:
                       - Kubeconfig
-                      - GCPServiceAccountKey
+                      - GoogleApplicationCredentials
                     name:
                       type: string
                       description: Name of the Secret.

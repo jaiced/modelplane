@@ -115,6 +115,16 @@ nix flake check            # or: ./nix.sh flake check
 `nix run .#fix` auto-fixes most lint and formatting issues. Run it before
 opening a PR.
 
+`nix flake check` is the unit layer — fast and sandboxed, proving each
+composition function renders the right resources. The integration layer is
+`nix run .#e2e`, which brings up two local `kind` clusters and runs the
+whole path — scheduling, the serving-stack install on a registered cluster,
+gateway routing, a live request — with no cloud credentials. Add `-- --verify`
+and it waits for readiness, asserts a 200, and exits non-zero on failure. That
+verify command is what the label-gated `E2E` workflow runs on CI (add the
+`test-e2e` label to a PR), so a green local `--verify` and a green CI run mean
+the same thing. See `e2e/README.md`.
+
 ## Submitting changes
 
 Before opening a PR, run `nix flake check` and make sure it passes. If you
@@ -343,39 +353,76 @@ are Linux images assembled entirely from data — a prebuilt Python interpreter
 and dependency wheels plus our own source — so there's no cross-compilation. The
 same is true of `nix run .#build`.
 
+## Bumping aicr
+
+The serving stack's EKS, AKS and GKE component lists are generated from
+NVIDIA AICR recipes by `functions/compose-serving-stack/generate.py`
+(`nix run .#stacks`), pinned to one aicr release. A bump changes the
+components and versions every managed cluster runs on the next
+Modelplane release, so it lands as a reviewed stack change, never as an
+auto-merged dependency update. aicr releases about every two weeks and
+its schemas are still `v1alpha*`, so expect the generator's fail-closed
+checks to trip. In order:
+
+1. Update `AICR_PIN` in generate.py and `version` in `nix/aicr.nix`
+   together, with hashes from the release's `aicr_checksums.txt`. The
+   two must move in lockstep; the generator refuses a mismatched aicr.
+2. Re-sync the embedded gke-cos fork (`GKE_COS_OVERLAY` in generate.py):
+   diff it against the new tag's `recipes/overlays/gke-cos.yaml` and
+   re-apply the one change (the `dra` profile value, the 1.35 floor, and
+   the DRA selector paths on the stock values for union totality). The
+   file is high-churn upstream. The fork is deleted the day
+   NVIDIA/aicr#2515 or #2517 lands.
+3. Expect `ALLOW`/`DROP` to fail closed on any component the new catalog
+   adds; classify it with a reason.
+4. Expect the managed-path assertions to fail closed if a values path
+   moved or a `--set` stopped landing; re-derive the path from the new
+   chart before loosening anything. `MODELPLANE_VALUES` fails closed too
+   if a new recipe starts carrying one of its paths - decide whose value
+   wins and move the path to the right table.
+5. Both embedded catalog documents carry an apiVersion that can move in
+   any release.
+6. The Kubernetes floor union re-checks against `k8s_default` in
+   `CLOUDS`, which must track the cloud cluster XRD defaults.
+7. `nix run .#stacks`, run twice to confirm no diff, and review the
+   generated diff as the release's stack change. The `stacks-current`
+   flake check regenerates in the sandbox and fails CI on a stale or
+   hand-edited generated file.
+
+Where a bumped component also exists in the hand-written cloud halves
+(`function/stacks/clouds/`), mirror the shared pins there so one review
+moves both.
+
 ## Working on the docs site
 
-The documentation site under `docs/` is a [Hugo](https://gohugo.io/) project.
-`nix flake check` builds it as one of its checks, so a broken site fails CI.
+Docs prose lives here under `docs/content/`, with the example manifests it
+embeds under `docs/manifests/` and the API reference's grouping in `docs/data/`.
+The site that renders it — the [Hugo](https://gohugo.io/) project, its layouts,
+theme, and asset pipelines — is the
+[docs-site](https://github.com/modelplaneai/docs-site) repo. Edit prose here;
+edit the site there.
 
-Run the commands below from the repository root, not from `docs/`. They're flake
-apps (`nix run .#...`), so they resolve against the flake at the root regardless
-of which file you're editing.
-
-Preview it locally with live reload:
-
-```bash
-nix run .#docs-serve            # http://localhost:1313
-```
-
-`nix build .#docs` produces the production site in `result/`. The production
-build compiles the theme's SCSS and runs it through PostCSS to strip unused
-CSS, sort media queries, and minify. Those Node dependencies are pinned in
-`docs/package-lock.json` and built reproducibly; the local preview skips them.
-
-The site's JavaScript bundle is built by webpack and committed to git under the
-theme's assets. Rebuild it after changing anything under
-`docs/utils/webpack/src/` and commit the result:
+Preview what you are editing, with live reload, from the root of this repo:
 
 ```bash
-nix run .#docs-generate
+nix run github:modelplaneai/docs-site#preview  # http://localhost:1313
 ```
+
+The site serves this working tree, so the pages you see are the files under
+your cursor: no branch to push, no pin to move, and nothing about Hugo checked
+in here. The version switcher lists every version and those links 404 locally,
+since only this one is being served.
+
+Versions are this repo's `release-X.Y` branches: whatever is on `release-0.2` is
+what the 0.2 docs say. The site repo builds each of them, decides which release
+is latest, and deploys; see [RELEASING.md](RELEASING.md).
 
 ### Manifest shortcodes
 
 Annotated YAML manifests live under `docs/manifests/`, one subtree per docs
 section: `getting-started/` backs the getting started guide, `concepts/` backs
-the platform and model concept pages, and `examples/` backs the Examples page.
+the platform and model concept pages, `recipes/` backs the Recipes section,
+and `guides/` backs the Guides section.
 A page references only manifests from its own section's subtree. Two shortcodes
 render them in content pages.
 
@@ -423,13 +470,18 @@ validator is `docs/utils/validate/validate_manifests.py`.
 
 ### Linting and link checking
 
-Docs prose is linted with [Vale](https://vale.sh) and internal links are checked
-with [htmltest](https://github.com/wjdp/htmltest). Both run as flake checks, so
-run them with the rest of CI:
+Docs prose is linted with [Vale](https://vale.sh), which runs as a flake check,
+so run it with the rest of CI:
 
 ```bash
 nix flake check
 ```
+
+Internal links are checked with [htmltest](https://github.com/wjdp/htmltest)
+against the built site, which means it runs in the site repo, not here. Nothing
+there pins a revision of this repo, so a content change that breaks a link
+fails on the next build there: the preview of your pull request, or the
+rebuild your merge triggers.
 
 Custom Modelplane rules live in `docs/utils/vale/styles/Modelplane/`.
 
@@ -444,13 +496,25 @@ CI runs them on every pull request via the same check (see
 
 ### Deployment
 
-The site deploys to [Vercel](https://vercel.com/). Vercel builds it with the
-same `nix build .#docs` derivation that `nix flake check` verifies, so what
-ships matches what CI checks. `vercel.json` points the build at
-[`docs/vercel-build.sh`](docs/vercel-build.sh), which installs Nix into
-Vercel's build image, runs the build, and writes the static site to `public/`.
-Vercel's GitHub app drives deploys as usual: preview URLs on pull requests
-(including from forks) and production on merge to `main`.
+The site repo holds the only Vercel project.
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml) here asks it to
+render, and never renders anything itself:
+
+| Here | There |
+|---|---|
+| a pull request touching `docs/` or `apis/` | deploys that revision as a preview |
+| a merge to `main` or a `release-*` branch | rebuilds every version into production |
+
+A merge is what publishes: nothing there pins a content revision, so
+publishing is a rebuild that reads the tip of every branch.
+
+The preview link is posted on the pull request as soon as it opens, because the
+hostname follows from the pull request number rather than from the deployment —
+so the site repo needs no write access here. It answers once that repo's
+`Content` workflow finishes, a minute or so later.
+
+A pull request from a fork gets neither secrets nor a write token, so it gets
+no preview; use the local command above.
 
 ## Releasing
 

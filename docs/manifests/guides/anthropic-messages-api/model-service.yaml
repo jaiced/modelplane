@@ -1,0 +1,16 @@
+# Exposes the qwen3-8b deployment as one model a caller can name. An
+# InferenceGateway serving it answers both the OpenAI and Anthropic APIs, so the
+# same model is reachable at .../v1/chat/completions and .../anthropic/v1/messages.
+# Name the model, ml-team/qwen3-8b, in the request body to a gateway that serves
+# it.
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelService
+metadata:
+  name: qwen3-8b
+  namespace: ml-team
+spec:
+  endpoints:
+  - name: qwen3-8b
+    selector:
+      matchLabels:
+        modelplane.ai/deployment: qwen3-8b

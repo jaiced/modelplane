@@ -10,58 +10,27 @@ A `ModelEndpoint` is a single reachable inference endpoint that a
 one for each of your replicas automatically, but you can also create one by hand
 to point at an inference endpoint Modelplane doesn't run, most often a SaaS
 provider like Together or Baseten. A service treats both the same, so you can
-front your own replicas and an external provider behind one URL: send overflow to
-the provider when your fleet is busy, or fail over to it as a break-glass option.
+front your own replicas and an external provider as one model, splitting traffic
+between them or keeping the provider as a backup.
 
 ## Routing to an external provider
 
-Create a `ModelEndpoint` with three things:
+Create a `ModelEndpoint` with the five things the manifest numbers:
 
-```yaml {nocopy=true}
-apiVersion: modelplane.ai/v1alpha1
-kind: ModelEndpoint
-metadata:
-  name: kimi-k2-together
-  namespace: ml-team
-  labels:
-    # 1. A label of your own for a ModelService to select on. Any label
-    #    works; modelplane.ai/external-provider is a readable convention.
-    modelplane.ai/external-provider: together
-spec:
-  # 2. The provider's base URL.
-  url: https://api.together.xyz/
-  # 3. The path to rewrite requests to. A ModelService receives requests at
-  #    /<namespace>/<service>/v1/... and rewrites them to this prefix, so an
-  #    OpenAI-compatible provider that serves /v1/... takes /v1/.
-  rewritePath: /v1/
-```
+{{< manifests "concepts/model-endpoint.yaml" >}}
 
 Then point a [`ModelService`]({{< ref "model-service.md" >}}) at it. Selecting
 `modelplane.ai/external-provider: together` routes to the provider; adding a
-second entry for a deployment fronts both behind one URL, so traffic can spill
-over to the provider alongside your own replicas:
+second entry for a deployment fronts both as one model, splitting its traffic
+between them by weight:
 
-```yaml {nocopy=true}
-apiVersion: modelplane.ai/v1alpha1
-kind: ModelService
-metadata:
-  name: kimi-k2
-  namespace: ml-team
-spec:
-  endpoints:
-  - selector:
-      matchLabels:
-        modelplane.ai/deployment: kimi-k2          # your own replicas
-  - selector:
-      matchLabels:
-        modelplane.ai/external-provider: together  # the endpoint above
-```
+{{< manifests "concepts/model-service-external.yaml" >}}
 
-The provider must speak the OpenAI API, since that's the contract a
-`ModelService` exposes. Anything OpenAI-compatible works; `url` and `rewritePath`
-are all that change between providers.
+To keep the provider as a backup instead, see
+[failover tiers]({{< ref "model-service.md#failover-tiers" >}}).
+
+Anything speaking the OpenAI or Anthropic API works. `origin` is the scheme and
+host to reach it at, with no path; `api.prefix` is the path the provider serves
+those APIs under, and `api.schema` which of the two it speaks. Only those change
+between providers.
 <!-- vale write-good.Passive = YES -->
-
-## Example
-
-{{< manifests "concepts/model-endpoint.yaml" >}}

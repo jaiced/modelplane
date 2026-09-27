@@ -45,6 +45,7 @@ nodeCount
 nodePool
 nodePools
 workerTemplate
+Dynamo
 runtimeClassName
 imagePullSecret
 
@@ -74,10 +75,12 @@ ResourceClaim
 ResourceClaims
 ResourceSlice
 ResourceSlices
+ComputeDomains
 DeviceRequest
 DeviceRequests
 HTTPRoute
 HTTPRoutes
+GatewayClass
 URLRewrite
 ClusterRole
 ClusterRoles
@@ -90,7 +93,10 @@ ReplicaSets
 LoadBalancer
 ReadWriteMany
 StorageClass
+PodCliqueSet
+PodCliqueSets
 LeaderWorkerSet
+LeaderWorkerSets
 kubeconfig
 kube-apiserver
 kube-controller-manager
@@ -104,11 +110,13 @@ Helm
 vLLM
 [Hh]uggingFace
 NVIDIA
+NVLink
 Envoy
 Traefik
 MetalLB
 NIXL
 NixlConnector
+GPUDirect
 Prometheus
 ArgoCD
 FluxCD
@@ -155,18 +163,38 @@ llms-full\.txt
 
 # ML and AI
 Qwen
+Qwen2.5-72B
 Qwen3-8B
 Qwen3-Coder
 Kimi-K2
 Kimi
 Llama
+Laguna[\w.-]*
+Nemotron[\w.-]*
+GLM[\w.-]*
+Unsloth|unsloth
+NVIDIA|nvidia
+NVFP4
+Mamba
+OpenMDW-1.1
 NIM
 GGUF
 LoRA
 MoE
 SGLang
-# Parameter counts: 8B, 35B, 480B, 1T, etc.
+[Nn]-gram
+prompt-lookup
+copy-heavy
+[Ww]all-clock
+[Ii]nter-token
+TPOT
+ITL
+TTFT
 [0-9]+[BMT]
+A[0-9]+B
+IQ4_XS
+llama\.cpp
+multi-GPU
 [Vv][Rr][Aa][Mm]
 tensor
 tokenizer
@@ -210,8 +238,9 @@ europe-central2
 # Acronyms
 GPU
 GPUs
+CDI
+CSI
 DRA
-LWS
 NIC
 NFS
 PVCs?
@@ -220,15 +249,19 @@ RWX
 SaaS
 P2P
 L4
+L40S
 H100
 H200
 EFA
 BF16
+FP16
 FP8
 INT4
+AWQ
 InfiniBand
 CEL
 CLI
+KAI
 APIs?
 CI
 CSS
@@ -324,6 +357,7 @@ coordinator-only
 cross-reference
 cross-resource
 day-two
+deduped
 deprovisioned
 double-check
 dry-run
@@ -359,6 +393,7 @@ multi-pod
 multi-region
 multi-tenant
 multi-tenancy
+mixture-of-experts
 namespace-scoped
 namespaced
 namespaces?
@@ -373,13 +408,16 @@ one-way
 OpenAI-compatible
 out-of-sync
 per-node
+pod-identity
 pre-existing
 pre-provisioned
 pre-releases?
 pre-stage
+pre-staged
 read-only
 read-write
 ready-made
+region-gated
 resource-intensive
 self-contained
 self-service
@@ -391,6 +429,7 @@ single-pod
 sidecar
 source-specific
 step-by-step
+still-read
 subresources?
 third-party
 top-level
@@ -424,6 +463,7 @@ usually
 SKU
 SKUs
 T4
+A16
 A100
 as-is
 hardcode
@@ -439,6 +479,7 @@ autoscaled
 delete-plus-create
 [Dd]evice-level
 fabric-aware
+gang-scheduled
 garbage-collects
 highest-index
 load-balanced
@@ -446,6 +487,10 @@ overcommit
 per-pool
 per-cluster
 per-replica
+per-service
+[Ff]ailover
+PKI
+trust-manager
 [Rr]e-placement
 sub-node
 under-count
@@ -480,6 +525,21 @@ KServe
 Slurm
 KubeAI
 Kueue
+Grove
+GROVE_PCS_NAME
+GROVE_PCS_INDEX
+GROVE_PCLQ_POD_INDEX
+GROVE_HEADLESS_SERVICE
+MODELPLANE_LEADER_ADDRESS
+MODELPLANE_RANK
+ModelExpress
+topology-aware
+all-or-nothing
+[Pp]eer-to-peer
+[Gg]ang-schedules?
+routable
+pipeline-parallel
+Qwen2.5-14B
 
 agent
 requirement
@@ -504,6 +564,7 @@ CKS
 CMK
 VKE
 Nebius
+mk8s
 OVHcloud
 Vultr
 Fluidstack

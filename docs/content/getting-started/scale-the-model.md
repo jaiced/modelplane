@@ -11,14 +11,14 @@ across two regions.
 ```mermaid
 graph LR
     subgraph fleet ["Fleet"]
-        IC1["us-east\nL4"]
-        IC2["us-west\nlarger GPU"]
+        IC1["cluster-a\nsmall GPU"]
+        IC2["cluster-b\nlarger GPU"]
     end
 
     subgraph ml ["ML team"]
         MD1["ModelDeployment\nqwen-demo"]
-        MD2["ModelDeployment\nqwen-west\nclusterSelector: us-west"]
-        MS["ModelService qwen\n/ml-team/qwen/v1/..."]
+        MD2["ModelDeployment\nqwen-west\ntargets cluster-b"]
+        MS["ModelService qwen\nmodel: ml-team/qwen"]
     end
 
     IC1 --> MD1
@@ -27,10 +27,12 @@ graph LR
     MD2 --> MS
 ```
 
-## Deploy to a second region
+## Add a second deployment
 
-The new deployment uses a `clusterSelector` to pin its replica to the `us-west`
-cluster you added in the last step, and selects the larger GPU there:
+The new deployment targets a larger-GPU cluster you added in the last step. On
+EKS, GKE, and AKS it pins to a second region with a `clusterSelector`. On Nebius,
+which runs one region per project, the capacity selector alone routes it to the
+`H100` tier:
 
 {{< tabs >}}
 {{< tab "EKS" >}}
@@ -38,6 +40,12 @@ cluster you added in the last step, and selects the larger GPU there:
 {{< /tab >}}
 {{< tab "GKE" >}}
 {{< manifests "getting-started/gke/model-deployment-west.yaml" >}}
+{{< /tab >}}
+{{< tab "AKS" >}}
+{{< manifests "getting-started/aks/model-deployment-west.yaml" >}}
+{{< /tab >}}
+{{< tab "Nebius" >}}
+{{< manifests "getting-started/nebius/model-deployment-scale.yaml" >}}
 {{< /tab >}}
 {{< /tabs >}}
 
@@ -57,16 +65,18 @@ qwen-west-92535   eks-us-west   True     True    modelreplicas.modelplane.ai   8
 ## Front both with one service
 
 Update the `ModelService` to select both deployments. Each entry in
-`spec.endpoints` adds its matching replicas to the same endpoint:
+`spec.endpoints` adds its matching replicas to the same model:
 
 {{< manifests "getting-started/model-service-multi.yaml" >}}
 
-The endpoint URL doesn't change. Clients that had this URL before still have it;
-they don't know the fleet changed. The gateway load-balances across both regions,
-and losing one region keeps the other serving. Send the same request as before:
+The model name doesn't change. Callers that had it before still have it; they
+don't know the fleet changed. The gateway load-balances across both regions, and
+if one region's replicas fail it sends every request to the other. The gateway
+itself runs in one region, so surviving the loss of that region takes a second
+gateway on a cluster in the other. Send the same request as before:
 
 ```bash
-ADDRESS=$(kubectl get ms qwen -n ml-team -o jsonpath='{.status.address}')
+ADDRESS=$(kubectl get ig public -o jsonpath='{.status.endpoints.openAI}')
 ```
 
 ```bash
@@ -74,9 +84,9 @@ kubectl run -i --rm curl-test \
   --image=curlimages/curl \
   --restart=Never \
   --env="ADDRESS=$ADDRESS" \
-  -- sh -c 'curl -v "$ADDRESS/v1/chat/completions" \
+  -- sh -c 'curl -v "$ADDRESS/chat/completions" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"What is Kubernetes in one sentence?\"}],\"max_tokens\":100}"'
+  -d "{\"model\":\"ml-team/qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"What is Kubernetes in one sentence?\"}],\"max_tokens\":100}"'
 ```
 
 ## That's the tour

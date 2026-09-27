@@ -5,29 +5,12 @@
   description = "Modelplane - The open source control plane for AI models";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     # Unstable nixpkgs, exposed as pkgs.unstable. Used when we need a
     # newer version of a package than the stable channel ships, e.g. uv
     # tracking the latest uv_build releases.
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
-
-    # Pinned to crossplane/cli main rather than a released version, because we
-    # depend on several CLI changes that aren't in a release yet:
-    #
-    #   * #24, #64: a datamodel-code-generator bump that fixes Python model
-    #     generation for fields named int/bool.
-    #   * #119: stops an XRD's scale subresource from clobbering the generated
-    #     model with the autoscaling Scale type.
-    #   * #126: makes the flake's default package the host-native CLI binary
-    #     instead of the full multi-platform release bundle. Building one platform
-    #     instead of seven cuts the CLI build from ~55 minutes to ~8 on a cold
-    #     machine.
-    #   * #127: decompresses function runtime tarballs once when loading them,
-    #     rather than once per layer.
-    #
-    # Repin to a tag once these all release.
-    crossplane-cli.url = "github:crossplane/cli";
 
     # uv2nix reads a uv workspace's uv.lock and generates Nix derivations
     # for each Python package, using pyproject.nix's build infrastructure.
@@ -57,7 +40,6 @@
       self,
       nixpkgs,
       nixpkgs-unstable,
-      crossplane-cli,
       pyproject-nix,
       uv2nix,
       pyproject-build-systems,
@@ -68,16 +50,20 @@
 
       # The composition functions that make up Modelplane.
       functionNames = [
+        "compose-aks-cluster"
         "compose-eks-cluster"
         "compose-gke-cluster"
         "compose-inference-class"
         "compose-inference-cluster"
         "compose-inference-gateway"
+        "compose-nebius-cluster"
         "compose-serving-stack"
+        "compose-vultr-cluster"
         "compose-model-cache"
         "compose-model-deployment"
         "compose-model-endpoint"
         "compose-model-replica"
+        "compose-model-route"
         "compose-model-service"
         "compose-usages"
       ];
@@ -85,7 +71,6 @@
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
 
@@ -113,6 +98,11 @@
                   inherit system;
                 };
               })
+              # Current Upbound CLI; nixpkgs' package lags the stable
+              # channel (see nix/upbound.nix).
+              (import ./nix/upbound.nix)
+              # NVIDIA AICR CLI; nixpkgs has no package (see nix/aicr.nix).
+              (import ./nix/aicr.nix)
             ];
           };
         };
@@ -133,8 +123,6 @@
         }
       );
 
-      # Build the docs site with nix build .#docs.
-      #
       # Function runtime images are Linux images, but they're assembled purely
       # from data (a cached interpreter, prebuilt wheels, and our source), so
       # they build on any host - including macOS - with no cross-compilation or
@@ -143,7 +131,6 @@
       packages = forAllSystems (
         { pkgs, ... }:
         let
-          docs = import ./nix/docs.nix { inherit pkgs self; };
           functions = import ./nix/functions.nix {
             inherit
               pkgs
@@ -155,10 +142,7 @@
               ;
           };
         in
-        {
-          docs = docs.site;
-        }
-        // functions.images
+        functions.images
         // {
           functions = functions.all;
         }
@@ -167,7 +151,7 @@
       apps = forAllSystems (
         { pkgs, system, ... }:
         let
-          deps = import ./nix/deps.nix { inherit pkgs crossplane-cli; };
+          deps = import ./nix/deps.nix { inherit pkgs; };
           apps = import ./nix/apps.nix { inherit pkgs; };
           crossplane = deps.crossplane { inherit system; };
           functionsPkg = self.packages.${system}.functions or null;
@@ -180,22 +164,22 @@
           };
           push = apps.push {
             inherit crossplane version;
-            dockerCredentialUp = pkgs.upbound;
+            inherit (pkgs) upbound;
           };
           run = apps.run {
             inherit crossplane functionsPkg;
             dockerCredentialUp = pkgs.upbound;
           };
           stop = apps.stop { inherit crossplane; };
-          docs-serve = apps.docsServe { };
-          docs-generate = apps.docsGenerate { };
+          e2e = apps.e2e { inherit crossplane functionsPkg; };
+          stacks = apps.stacks { inherit (pkgs) aicr; };
         }
       );
 
       devShells = forAllSystems (
         { pkgs, system, ... }:
         let
-          deps = import ./nix/deps.nix { inherit pkgs crossplane-cli; };
+          deps = import ./nix/deps.nix { inherit pkgs; };
           crossplane = deps.crossplane { inherit system; };
         in
         {
@@ -203,6 +187,7 @@
             buildInputs = [
               crossplane
               pkgs.upbound
+              pkgs.aicr
               pkgs.kubectl
               pkgs.kubernetes-helm
               pkgs.kind
@@ -211,9 +196,7 @@
               pkgs.python3
               pkgs.unstable.ruff
               pkgs.unstable.ty
-              pkgs.nixfmt-rfc-style
-              pkgs.hugo
-              pkgs.nodejs
+              pkgs.nixfmt
             ];
 
             shellHook = ''
@@ -230,7 +213,7 @@
               echo "  nix flake check               nix run .#fix"
               echo "  nix run .#build               nix run .#push"
               echo "  nix run .#run                 nix run .#stop"
-              echo "  nix run .#docs-serve          nix run .#docs-generate"
+              echo "  nix run .#stacks"
               echo ""
             '';
           };

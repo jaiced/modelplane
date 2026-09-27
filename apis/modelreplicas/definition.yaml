@@ -5,7 +5,7 @@ metadata:
 spec:
   group: modelplane.ai
   names:
-    categories: [crossplane, modelplane]
+    categories: [crossplane, modelplane, models]
     kind: ModelReplica
     plural: modelreplicas
     shortNames: [mr]
@@ -100,12 +100,14 @@ spec:
                   required: [name, members]
                   # An engine is exactly one Standalone member, or one Leader
                   # and one Worker member - the two shapes the backends compose
-                  # (a Deployment or a LeaderWorkerSet). A multi-node gang's size
-                  # lives in the Worker member's worker.nodes, not in repeated
-                  # Worker members, so members caps at two. select_backend
-                  # switches on Standalone-present, and the llm-d backend
-                  # dereferences the Leader and Worker members, so any other
-                  # role combination would crash or compose the wrong workload.
+                  # (a Deployment, or a LeaderWorkerSet or Grove PodCliqueSet
+                  # depending on the cluster's stack). A multi-node gang's
+                  # size lives in the Worker member's worker.nodes, not in
+                  # repeated Worker members, so members caps at two.
+                  # select_backend switches on Standalone-present, and the
+                  # Grove backend dereferences the Leader and Worker members,
+                  # so any other role combination would crash or compose the
+                  # wrong workload.
                   #
                   # The scheduler also only places an engine where at least one
                   # member resolves a claimable device; an engine where no
@@ -250,15 +252,38 @@ spec:
                             properties:
                               metadata:
                                 type: object
+                                # Mirrors the ModelDeployment member metadata
+                                # rules. Replicas are composed from an
+                                # already-validated deployment, so this is a
+                                # backstop for directly authored ModelReplicas;
+                                # keeping the schemas identical preserves the
+                                # round-trip contract noted on worker above.
+                                x-kubernetes-validations:
+                                - rule: "!has(self.labels) || self.labels.all(k, !k.startsWith('modelplane.ai/'))"
+                                  message: "member template.metadata.labels keys must not use the reserved modelplane.ai/ prefix"
+                                - rule: "!has(self.labels) || self.labels.all(k, k.matches('^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$'))"
+                                  message: "member template.metadata.labels keys must be valid Kubernetes label keys"
+                                - rule: "!has(self.labels) || self.labels.all(k, k.split('/')[0].size() <= 253)"
+                                  message: "member template.metadata.labels key prefixes must be DNS subdomains of at most 253 characters"
+                                - rule: "!has(self.labels) || self.labels.all(k, self.labels[k].matches('^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$'))"
+                                  message: "member template.metadata.labels values must be valid Kubernetes label values"
+                                - rule: "!has(self.annotations) || self.annotations.all(k, k.matches('^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$'))"
+                                  message: "member template.metadata.annotations keys must be valid Kubernetes annotation keys"
+                                - rule: "!has(self.annotations) || self.annotations.all(k, k.split('/')[0].size() <= 253)"
+                                  message: "member template.metadata.annotations key prefixes must be DNS subdomains of at most 253 characters"
                                 properties:
                                   labels:
                                     type: object
+                                    maxProperties: 32
                                     additionalProperties:
                                       type: string
+                                      maxLength: 63
                                   annotations:
                                     type: object
+                                    maxProperties: 32
                                     additionalProperties:
                                       type: string
+                                      maxLength: 8192
                               spec:
                                 type: object
                                 required: [containers]

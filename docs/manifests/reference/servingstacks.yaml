@@ -4,19 +4,21 @@ metadata:
   name: west-gke-stack
   namespace: platform
 spec:
+  cloud: GKE
   secrets:
     - type: Kubeconfig
       name: west-gke-kubeconfig
       key: kubeconfig
-    - type: GCPServiceAccountKey
+    - type: GoogleApplicationCredentials
       name: west-gke-sa-key
       key: private_key
-  versions:
-    gatewayApi: "v1.5.1"
-    certManager: "v1.17.1"
-    envoyGateway: "v1.8.1"
+  # Projected from the InferenceCluster: the name InferenceGateways reach this
+  # cluster's gateway by, and the CAs whose client certificates it accepts.
   gateway:
-    listeners:
-      - name: http
-        port: 80
-        protocol: HTTP
+    hostname: gateway-west-gke-1a2b3.modelplane-system.svc.cluster.local
+    clientCAs:
+      - name: eu
+        certificate: |
+          -----BEGIN CERTIFICATE-----
+          MIIBszCCAVmgAwIBAgIQ…
+          -----END CERTIFICATE-----

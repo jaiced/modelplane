@@ -54,6 +54,12 @@ class ConnectionDetail(BaseModel):
 
 
 class ForProvider(BaseModel):
+    deletionPropagationPolicy: Literal['Orphan', 'Background', 'Foreground'] | None = (
+        'Background'
+    )
+    """
+    Deletion policy for created kubernetes object, defaults to Background
+    """
     manifest: dict[str, Any]
     """
     Raw JSON representation of the kubernetes object to be created.
@@ -258,6 +264,13 @@ class Status(BaseModel):
     conditions: list[Condition] | None = None
     """
     Conditions of the resource.
+    """
+    lastHandledReconcileAt: str | None = None
+    """
+    LastHandledReconcileAt holds the value of the most recent
+    reconcile-requested-at annotation token that the controller has
+    processed. Users can compare this to the annotation to determine
+    whether a reconcile request has been handled.
     """
     observedGeneration: int | None = None
     """

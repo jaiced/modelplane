@@ -15,11 +15,12 @@
 """Compose an InferenceCluster.
 
 This function orchestrates the internal XRs that make up an inference
-cluster. It dispatches on the cluster source (GKE, Existing) to determine
-how the cluster is obtained, then composes a ServingStack on it.
+cluster. It dispatches on the cluster source (GKE, EKS, AKS, Nebius,
+Vultr, or Existing) to determine how the cluster is obtained, then
+composes a ServingStack on it.
 
-GPU node pools reference InferenceClasses. For provisioned (GKE)
-clusters the class's provisioning block describes how to build the pool;
+GPU node pools reference InferenceClasses. For provisioned clusters
+the class's provisioning block describes how to build the pool;
 for BYO (Existing) clusters the class is a pure description of pools
 that already exist. Either way, the class's resources block populates
 status.gpuPools so the scheduler can match models.
@@ -29,30 +30,43 @@ to host control-plane components (Envoy Gateway, Prometheus, etc.).
 The system pool is not exposed in the user-facing API.
 """
 
+from typing import Final, Literal
+
 import grpc
 from crossplane.function import logging, request, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from crossplane.function.proto.v1 import run_function_pb2_grpc as grpcv1
 from models.ai.modelplane.inferenceclass import v1alpha1 as iclv1alpha1
 from models.ai.modelplane.inferencecluster import v1alpha1
+from models.ai.modelplane.inferencegateway import v1alpha1 as igv1alpha1
+from models.ai.modelplane.infrastructure.akscluster import v1alpha1 as aksv1alpha1
 from models.ai.modelplane.infrastructure.ekscluster import v1alpha1 as eksv1alpha1
 from models.ai.modelplane.infrastructure.gkecluster import v1alpha1 as gkev1alpha1
+from models.ai.modelplane.infrastructure.nebiuscluster import v1alpha1 as nebiusv1alpha1
 from models.ai.modelplane.infrastructure.servingstack import v1alpha1 as ssv1alpha1
+from models.ai.modelplane.infrastructure.vultrcluster import v1alpha1 as vultrv1alpha1
+from models.ai.modelplane.modelcache import v1alpha1 as mcv1alpha1
+from models.io.crossplane.apiextensions.managedresourceactivationpolicy import (
+    v1alpha1 as mrapv1alpha1,
+)
 from models.io.crossplane.m.kubernetes.clusterproviderconfig import (
     v1alpha1 as k8scpcv1alpha1,
 )
+from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
 from models.io.crossplane.protection.clusterusage import v1beta1 as clusterusagev1beta1
 from models.io.crossplane.protection.usage import v1beta1 as usagev1beta1
 from models.io.k8s.apimachinery.pkg.apis.meta import v1 as metav1
 
-# Cluster source discriminator values from the XRD enum.
-CLUSTER_SOURCE_GKE = "GKE"
-CLUSTER_SOURCE_EKS = "EKS"
-CLUSTER_SOURCE_EXISTING = "Existing"
-
-# GKE installs the NVIDIA driver here rather than at the default / root; the
-# ServingStack passes it to the DRA driver so its kubelet plugin starts.
-_GKE_NVIDIA_DRIVER_ROOT = "/home/kubernetes/bin/nvidia"
+# Cluster source discriminator values from the XRD enum. The Literal
+# mirrors ServingStack spec.cloud, so passing a wrong or unsupported
+# cloud fails type checking; Final makes each constant a literal type.
+Cloud = Literal["GKE", "EKS", "AKS", "Nebius", "Vultr", "Existing"]
+CLUSTER_SOURCE_GKE: Final = "GKE"
+CLUSTER_SOURCE_EKS: Final = "EKS"
+CLUSTER_SOURCE_AKS: Final = "AKS"
+CLUSTER_SOURCE_NEBIUS: Final = "Nebius"
+CLUSTER_SOURCE_VULTR: Final = "Vultr"
+CLUSTER_SOURCE_EXISTING: Final = "Existing"
 
 # Condition types and reasons for the InferenceCluster XR.
 CONDITION_TYPE_CLUSTER_READY = "ClusterReady"
@@ -73,15 +87,30 @@ BACKEND_RESOURCE_KEY = "serving-stack"
 # deletion while ModelReplicas are scheduled to it.
 _REPLICA_GUARD_RESOURCE_KEY = "usage-replicas"
 
-# Label stamped on ModelReplicas by compose-model-deployment, carrying the name
-# of the InferenceCluster the replica is scheduled to. Kept in sync with that
-# function's _LABEL_CLUSTER.
+# Label stamped on ModelReplicas by compose-model-deployment, and on ModelRoutes
+# by compose-model-service, carrying the name of the InferenceCluster the object
+# is scheduled to. This function selects both by it to find the namespaces whose
+# mirror it must compose on the cluster. Kept in sync with those functions'
+# _LABEL_CLUSTER.
 _LABEL_CLUSTER = "modelplane.ai/cluster"
 
-# Secret types that couple compose-gke-cluster (writer) to this function
-# (reader) and compose-serving-stack (reader).
+# A namespaced resource in control-plane namespace `ml-team` composes its objects
+# into child_name("mp", "ml-team") on the cluster, e.g. `mp-ml-team-1a2b3`, so a
+# name need only be unique within a team. The hash keeps a long team namespace
+# within Kubernetes' 63 character limit, and the prefix keeps a team namespace
+# named `default` or `kube-system` off the cluster's own. provider-kubernetes
+# won't create that namespace, so this function does, one per team that has a
+# ModelReplica, ModelRoute or ModelCache on the cluster. The name and label are a
+# cross-function contract with compose-model-replica, compose-model-route and
+# compose-model-cache, whose objects land there, and with both gateways'
+# listeners, which select routes by the label.
+_NS_PREFIX = "mp"
+_NS_LABEL = "modelplane.ai/namespace"
+
+# Secret type that couples compose-gke-cluster (writer) to this function
+# (reader). Every other secret type is a provider identity type, passed through
+# to the ProviderConfigs unchanged.
 _SECRET_TYPE_KUBECONFIG = "Kubeconfig"
-_SECRET_TYPE_GCP_SA_KEY = "GCPServiceAccountKey"
 
 # The modelplane-system namespace. Used for the ServingStack XR,
 # ClusterProviderConfig secretRefs, and status.namespace.
@@ -90,12 +119,109 @@ _NAMESPACE_SYSTEM = "modelplane-system"
 # Identity type for GCP service account credentials.
 _IDENTITY_TYPE_GCP = "GoogleApplicationCredentials"
 
+# Identity type for Nebius service account credentials.
+_IDENTITY_TYPE_NEBIUS = "NebiusServiceAccountCredentials"
+
+# The managed resource kinds each cloud's cluster XR composes, and so the
+# ManagedResourceDefinitions its activation policy activates. Only this
+# cluster-scoped XR can compose the (cluster-scoped) policy; the namespaced
+# cluster XRs it composes cannot. Keep each list in sync with the resources
+# compose-<cloud>-cluster composes - a kind composed but missing here never
+# gets a CRD, and composing it fails the whole reconcile. provider-helm and
+# provider-kubernetes are omitted: the Configuration's own policy keeps those
+# active for every control plane.
+_ACTIVATE_AWS = (
+    "eips.ec2.aws.m.upbound.io",
+    "internetgateways.ec2.aws.m.upbound.io",
+    "launchtemplates.ec2.aws.m.upbound.io",
+    "natgateways.ec2.aws.m.upbound.io",
+    "routes.ec2.aws.m.upbound.io",
+    "routetables.ec2.aws.m.upbound.io",
+    "routetableassociations.ec2.aws.m.upbound.io",
+    "securitygroups.ec2.aws.m.upbound.io",
+    "securitygroupegressrules.ec2.aws.m.upbound.io",
+    "securitygroupingressrules.ec2.aws.m.upbound.io",
+    "subnets.ec2.aws.m.upbound.io",
+    "vpcs.ec2.aws.m.upbound.io",
+    "filesystems.efs.aws.m.upbound.io",
+    "mounttargets.efs.aws.m.upbound.io",
+    "addons.eks.aws.m.upbound.io",
+    "clusters.eks.aws.m.upbound.io",
+    "clusterauths.eks.aws.m.upbound.io",
+    "nodegroups.eks.aws.m.upbound.io",
+    "podidentityassociations.eks.aws.m.upbound.io",
+    "policies.iam.aws.m.upbound.io",
+    "roles.iam.aws.m.upbound.io",
+    "rolepolicyattachments.iam.aws.m.upbound.io",
+)
+_ACTIVATE_GCP = (
+    "projectiammembers.cloudplatform.gcp.m.upbound.io",
+    "projectservices.cloudplatform.gcp.m.upbound.io",
+    "serviceaccounts.cloudplatform.gcp.m.upbound.io",
+    "serviceaccountkeys.cloudplatform.gcp.m.upbound.io",
+    "networks.compute.gcp.m.upbound.io",
+    "subnetworks.compute.gcp.m.upbound.io",
+    "clusters.container.gcp.m.upbound.io",
+    "nodepools.container.gcp.m.upbound.io",
+)
+_ACTIVATE_AZURE = (
+    "kubernetesclusters.containerservice.azure.m.upbound.io",
+    "kubernetesclusternodepools.containerservice.azure.m.upbound.io",
+    "subnets.network.azure.m.upbound.io",
+    "virtualnetworks.network.azure.m.upbound.io",
+    "resourcegroups.azure.m.upbound.io",
+)
+_ACTIVATE_NEBIUS = (
+    "filesystems.compute.nebius.m.upbound.io",
+    "gpuclusters.compute.nebius.m.upbound.io",
+    "clusters.mk8s.nebius.m.upbound.io",
+    "nodegroups.mk8s.nebius.m.upbound.io",
+    "networks.vpc.nebius.m.upbound.io",
+    "subnets.vpc.nebius.m.upbound.io",
+)
+_ACTIVATE_VULTR = (
+    "kubernetes.vke.vultr.m.upbound.io",
+    "kubernetesnodepools.vke.vultr.m.upbound.io",
+)
+
 
 def _name(meta: metav1.ObjectMeta | None) -> str:
     """The object's name, always set on resources read from the API server."""
     if meta is None or meta.name is None:
         raise ValueError("metadata.name is unexpectedly absent")
     return meta.name
+
+
+def _namespace(meta: metav1.ObjectMeta | None) -> str:
+    """The object's namespace, always set on namespaced resources read from the API server."""
+    if meta is None or meta.namespace is None:
+        raise ValueError("metadata.namespace is unexpectedly absent")
+    return meta.namespace
+
+
+def _gateway_hostname(cluster_name: str) -> str:
+    """The internal name an InferenceGateway addresses this cluster's gateway by.
+
+    Modelplane derives and resolves this itself, so a platform publishes no DNS
+    per cluster: compose-inference-gateway composes a Service of this name on
+    each InferenceGateway's cluster, pointing at this cluster's gateway address.
+    The name doubles as the SNI an InferenceGateway sends and the SAN on this
+    cluster
+    gateway's serving certificate, so it is stable and identical from every
+    cluster.
+
+    The first label is the Service's name, which must be a DNS-1035 label:
+    lowercase alphanumeric and '-', starting with a letter. A cluster name is a
+    DNS-1123 subdomain, so it may contain dots or start with a digit; the
+    "gateway" literal keeps the label starting with a letter. child_name hashes
+    the raw cluster name, so two clusters whose names differ only in '.' versus
+    '-' still get distinct labels; the dots are replaced afterwards, in the
+    result rather than the input, so the sanitising can't collapse that
+    distinction. NOTE(negz): assumes the cluster's DNS domain is the default
+    cluster.local.
+    """
+    label = resource.child_name("gateway", cluster_name).replace(".", "-")
+    return f"{label}.{_NAMESPACE_SYSTEM}.svc.cluster.local"
 
 
 class FunctionRunner(grpcv1.FunctionRunnerServiceServicer):
@@ -126,15 +252,27 @@ class Composer:
         # Resolved InferenceClasses, keyed by class name. Populated by
         # resolve_classes().
         self.classes: dict[str, iclv1alpha1.InferenceClass] = {}
+        # Client CA per InferenceGateway, keyed by gateway name.
+        self.gateway_cas: dict[str, str] = {}
 
     def compose(self) -> None:
-        # The replica guard runs first, before any early return. It only
-        # depends on which ModelReplicas reference this cluster, not on the
-        # cluster's source or whether its classes resolve. Gating it behind
-        # those would drop the guard on a reconcile where classes are
-        # transiently unresolved, deleting the ClusterUsage and letting the
-        # cluster be deleted while replicas still use it.
+        # Crossplane discards a function's desired resources on any reconcile
+        # that still has unfulfilled required resources, and re-invokes it once
+        # they resolve. So every resource this function reads is required here,
+        # up front, before any desired state is composed: that keeps them all on
+        # the first invocation for Crossplane to resolve in one pass, rather than
+        # a later require costing another round-trip on which this run's desired
+        # state is thrown away.
+        self.require_inputs()
+
+        # The replica guard, namespaces, and gateway CAs all run before any early
+        # return: none depends on the cluster's source or whether its classes
+        # resolve. Gating the guard behind those would drop its ClusterUsage on a
+        # reconcile where classes are transiently unresolved and let the cluster
+        # be deleted while replicas still use it.
         self.compose_replica_guard()
+        self.compose_namespaces()
+        self.resolve_gateway_cas()
 
         cluster = self.xr.spec.cluster
         if not cluster:
@@ -149,10 +287,97 @@ class Composer:
             self.compose_gke(cluster.gke)
         elif source == CLUSTER_SOURCE_EKS:
             self.compose_eks(cluster.eks)
+        elif source == CLUSTER_SOURCE_AKS:
+            self.compose_aks(cluster.aks)
+        elif source == CLUSTER_SOURCE_NEBIUS:
+            self.compose_nebius(cluster.nebius)
+        elif source == CLUSTER_SOURCE_VULTR:
+            self.compose_vultr(cluster.vultr)
         elif source == CLUSTER_SOURCE_EXISTING:
             self.compose_existing(cluster.existing)
         else:
             response.warning(self.rsp, f"unsupported cluster source: {source}")
+
+    def compose_activation(self, kinds: tuple[str, ...]) -> None:
+        """Activate the cloud managed resource kinds the cluster XR composes.
+
+        The policy is cluster scoped, so only this cluster-scoped XR can compose
+        it; the namespaced cluster XR it composes cannot. _activation_ready then
+        gates the cluster XR on the policy taking effect, so its managed
+        resources aren't composed before the API server knows their kinds.
+        """
+        resource.update(
+            self.rsp.desired.resources["activation"],
+            mrapv1alpha1.ManagedResourceActivationPolicy(
+                spec=mrapv1alpha1.Spec(activate=list(kinds)),
+            ),
+        )
+
+    def _activation_ready(self, kinds: tuple[str, ...]) -> bool:
+        """Whether the policy this function composed has activated every kind.
+
+        Read from the policy's own status.activated (the definitions it has set
+        Active), so no ManagedResourceDefinition (each of which carries a full
+        CRD schema) has to be pulled into the request. The policy reports
+        Healthy even when it matched no definitions, e.g. while a provider is
+        still installing, so this checks the kinds are present rather than
+        trusting Healthy.
+
+        TODO(negz): gate on an Established condition instead once the policy
+        reports one (crossplane/crossplane#7822). status.activated means the
+        policy set these definitions Active, not that their CRDs exist, so a
+        managed resource composed in the window before a CRD is served can
+        still fail its apply until the next reconcile.
+        """
+        activation = self.req.observed.resources.get("activation")
+        if activation is None:
+            return False
+        status = resource.struct_to_dict(activation.resource).get("status") or {}
+        activated = status.get("activated") or []
+        return all(kind in activated for kind in kinds)
+
+    def require_inputs(self) -> None:
+        """Require every resource this function reads. See compose() for why up front.
+
+        The ModelReplicas and ModelRoutes scheduled to this cluster (by
+        _LABEL_CLUSTER) drive the deletion guard and the mirrored namespaces; the
+        InferenceGateways carry the client CAs the cluster gateway must accept;
+        and the InferenceClasses back the node pools.
+        """
+        name = _name(self.xr.metadata)
+        for kind, key in (("ModelReplica", "model-replicas"), ("ModelRoute", "model-routes")):
+            response.require_resources(
+                self.rsp,
+                name=key,
+                api_version="modelplane.ai/v1alpha1",
+                kind=kind,
+                match_labels={_LABEL_CLUSTER: name},
+            )
+        # ModelCaches can't be label-selected to a cluster (one cache fans out to
+        # many), so require them all and filter by status.clusters[] in
+        # compose_namespaces. A ModelCacheHydration, one per cluster and
+        # _LABEL_CLUSTER-selectable like the replicas and routes, is the eventual
+        # replacement.
+        response.require_resources(
+            self.rsp,
+            name="model-caches",
+            api_version="modelplane.ai/v1alpha1",
+            kind="ModelCache",
+        )
+        response.require_resources(
+            self.rsp,
+            name="gateways",
+            api_version="modelplane.ai/v1alpha1",
+            kind="InferenceGateway",
+        )
+        for class_name in sorted({p.className for p in (self.xr.spec.nodePools or [])}):
+            response.require_resources(
+                self.rsp,
+                name=f"class-{class_name}",
+                api_version="modelplane.ai/v1alpha1",
+                kind="InferenceClass",
+                match_name=class_name,
+            )
 
     def compose_replica_guard(self) -> None:
         """Block deletion of the InferenceCluster while ModelReplicas use it.
@@ -171,19 +396,11 @@ class Composer:
         deletion of its `of` resource until the Usage itself is gone.
 
         The guard is gated on observing ModelReplicas labelled for this cluster,
-        across all namespaces. While any exist the ClusterUsage is composed and
-        the cluster can't be deleted. When the last replica goes the function
-        stops composing it; if a delete was already attempted, replayDeletion
-        re-issues it once the ClusterUsage is gone.
+        across all namespaces (required in require_inputs). While any exist the
+        ClusterUsage is composed and the cluster can't be deleted. When the last
+        replica goes the function stops composing it; if a delete was already
+        attempted, replayDeletion re-issues it once the ClusterUsage is gone.
         """
-        response.require_resources(
-            self.rsp,
-            name="model-replicas",
-            api_version="modelplane.ai/v1alpha1",
-            kind="ModelReplica",
-            match_labels={_LABEL_CLUSTER: _name(self.xr.metadata)},
-        )
-
         replicas = request.get_required_resources(self.req, "model-replicas")
         if not replicas:
             return
@@ -204,21 +421,84 @@ class Composer:
         )
         self.rsp.desired.resources[_REPLICA_GUARD_RESOURCE_KEY].ready = fnv1.READY_TRUE
 
+    def compose_namespaces(self) -> None:
+        """Compose the mirrored namespace each team's objects land in on the cluster.
+
+        A ModelReplica, ModelRoute or ModelCache in control-plane namespace
+        `ml-team` composes its objects into `mp-ml-team-<hash>` here, but
+        provider-kubernetes won't create that namespace, so this does, one per team
+        with any of the three on the cluster. Replicas and routes are label-
+        selected to this cluster (require_inputs), so every one returned counts;
+        caches fan out to many clusters, so only those whose status.clusters[]
+        names this cluster do.
+
+        The namespace is composed no-Delete so a team's namespace outlives the
+        removal of any one of its objects. It's marked ready unconditionally: a
+        namespace appearing for a newly-scheduled team must not flap the whole
+        cluster's readiness, and a real failure to create it surfaces on the
+        object whose own objects can't land.
+        """
+        name = _name(self.xr.metadata)
+        # Replicas and routes are label-selected to this cluster, so every one
+        # returned counts.
+        namespaces = {
+            _namespace(metav1.ObjectMeta.model_validate(o["metadata"]))
+            for key in ("model-replicas", "model-routes")
+            for o in request.get_required_resources(self.req, key)
+        }
+        # Caches carry no cluster label, so filter the fleet-wide list to those
+        # whose status names this cluster.
+        for c in request.get_required_resources(self.req, "model-caches"):
+            cache = mcv1alpha1.ModelCache.model_validate(c)
+            if cache.status and cache.status.clusters and any(sc.name == name for sc in cache.status.clusters):
+                namespaces.add(_namespace(cache.metadata))
+
+        pc = resource.child_name(name, "cluster-kubeconfig")
+        for ns in sorted(namespaces):
+            obj = k8sobjv1alpha1.Object(
+                metadata=metav1.ObjectMeta(namespace=_NAMESPACE_SYSTEM),
+                spec=k8sobjv1alpha1.Spec(
+                    providerConfigRef=k8sobjv1alpha1.ProviderConfigRef(
+                        kind="ClusterProviderConfig",
+                        name=pc,
+                    ),
+                    readiness=k8sobjv1alpha1.Readiness(policy="SuccessfulCreate"),
+                    forProvider=k8sobjv1alpha1.ForProvider(
+                        manifest={
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": {"name": resource.child_name(_NS_PREFIX, ns), "labels": {_NS_LABEL: ns}},
+                        }
+                    ),
+                ),
+            )
+            obj.spec.managementPolicies = ["Observe", "Create", "Update"]
+            key = f"namespace-{ns}"
+            resource.update(self.rsp.desired.resources[key], obj)
+            self.rsp.desired.resources[key].ready = fnv1.READY_TRUE
+
+    def resolve_gateway_cas(self) -> None:
+        """Collect the client CA of every InferenceGateway in the fleet.
+
+        Any gateway may forward to this cluster, and each signs its client
+        certificate with a CA of its own, so the cluster gateway has to accept
+        all of them. Read here rather than on the ServingStack because a
+        ServingStack knows only its own cluster, and this is fleet-wide state.
+
+        A gateway that hasn't published a CA yet is skipped. Its cluster's
+        cert-manager may still be installing, and refusing traffic from every
+        gateway because one isn't ready would be worse than accepting the rest.
+        """
+        for g in request.get_required_resources(self.req, "gateways"):
+            gw = igv1alpha1.InferenceGateway.model_validate(g)
+            if gw.status and gw.status.clientCACertificate:
+                self.gateway_cas[_name(gw.metadata)] = gw.status.clientCACertificate
+
     def resolve_classes(self) -> bool:
         """Declare and fetch every InferenceClass referenced by
-        spec.nodePools[].className. Returns False if any is missing,
-        in which case the function gates and waits."""
-        pools = self.xr.spec.nodePools or []
-        class_names = sorted({p.className for p in pools})
-
-        for name in class_names:
-            response.require_resources(
-                self.rsp,
-                name=f"class-{name}",
-                api_version="modelplane.ai/v1alpha1",
-                kind="InferenceClass",
-                match_name=name,
-            )
+        spec.nodePools[].className (required in require_inputs). Returns False if
+        any is missing, in which case the function gates and waits."""
+        class_names = sorted({p.className for p in (self.xr.spec.nodePools or [])})
 
         missing: list[str] = []
         for name in class_names:
@@ -251,20 +531,28 @@ class Composer:
             response.warning(self.rsp, "GKE configuration is required when source is GKE")
             return
 
-        self.compose_gke_cluster(gke)
+        self.compose_activation(_ACTIVATE_GCP)
+        if self._activation_ready(_ACTIVATE_GCP) or "gke-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_gke_cluster(gke)
 
         gke_ready = resource.get_condition(self.req.observed.resources.get("gke-cluster"), "Ready").status == "True"
         kubeconfig_secret = self.observed_gke_secret(_SECRET_TYPE_KUBECONFIG)
-        sa_key = self.observed_gke_secret(_SECRET_TYPE_GCP_SA_KEY)
+        sa_key = self.observed_gke_secret(_IDENTITY_TYPE_GCP)
         backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
 
         if gke_ready and kubeconfig_secret:
-            self.compose_cluster_provider_config(kubeconfig_secret.name, kubeconfig_secret.key, sa_key)
+            self.compose_cluster_provider_config(
+                kubeconfig_secret.name,
+                kubeconfig_secret.key,
+                identity_ref=sa_key,
+                identity_type=_IDENTITY_TYPE_GCP,
+            )
 
         backend_secrets = self.resolve_gke_backend_secrets(gke_ready=gke_ready, backend_exists=backend_exists)
         if backend_secrets or backend_exists:
             if backend_secrets:
-                self.compose_serving_stack(backend_secrets, nvidia_driver_root=_GKE_NVIDIA_DRIVER_ROOT)
+                self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_GKE)
             self.compose_gke_usage()
 
         if gke_ready:
@@ -290,7 +578,10 @@ class Composer:
             response.warning(self.rsp, "EKS configuration is required when source is EKS")
             return
 
-        self.compose_eks_cluster(eks)
+        self.compose_activation(_ACTIVATE_AWS)
+        if self._activation_ready(_ACTIVATE_AWS) or "eks-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_eks_cluster(eks)
 
         eks_ready = resource.get_condition(self.req.observed.resources.get("eks-cluster"), "Ready").status == "True"
         kubeconfig = self.observed_eks_secret(_SECRET_TYPE_KUBECONFIG)
@@ -302,7 +593,7 @@ class Composer:
         backend_secrets = self.resolve_eks_backend_secrets(eks_ready=eks_ready, backend_exists=backend_exists)
         if backend_secrets or backend_exists:
             if backend_secrets:
-                self.compose_serving_stack(backend_secrets)
+                self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_EKS)
             self.compose_eks_usage()
 
         if eks_ready:
@@ -313,6 +604,133 @@ class Composer:
         self.write_status(self.gpu_pools())
         self.derive_conditions(cluster_ready=eks_ready)
 
+    def compose_aks(self, aks: v1alpha1.Aks | None) -> None:
+        """Compose an InferenceCluster backed by a Modelplane-provisioned
+        AKS cluster. Composes the AKSCluster XR, waits for it to be ready,
+        then wires its kubeconfig into the backend.
+
+        The kubeconfig from the cluster's connection secret embeds a client
+        certificate for a cluster-admin local account, so the kubeconfig
+        alone is enough to reach the cluster.
+        """
+        if not aks:
+            response.warning(self.rsp, "AKS configuration is required when source is AKS")
+            return
+
+        self.compose_activation(_ACTIVATE_AZURE)
+        if self._activation_ready(_ACTIVATE_AZURE) or "aks-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_aks_cluster(aks)
+
+        aks_ready = resource.get_condition(self.req.observed.resources.get("aks-cluster"), "Ready").status == "True"
+        kubeconfig = self.observed_aks_secret(_SECRET_TYPE_KUBECONFIG)
+        backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
+
+        if aks_ready and kubeconfig:
+            self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
+
+        backend_secrets = self.resolve_aks_backend_secrets(aks_ready=aks_ready, backend_exists=backend_exists)
+        if backend_secrets or backend_exists:
+            if backend_secrets:
+                self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_AKS)
+            self.compose_aks_usage()
+
+        if aks_ready:
+            self.rsp.desired.resources["aks-cluster"].ready = fnv1.READY_TRUE
+            if not backend_exists:
+                response.normal(self.rsp, "AKS cluster ready, composing backend")
+
+        self.write_status(self.gpu_pools())
+        self.derive_conditions(cluster_ready=aks_ready)
+
+    def compose_nebius(self, nebius: v1alpha1.Nebius | None) -> None:
+        """Compose an InferenceCluster backed by a Modelplane-provisioned
+        Nebius mk8s cluster. Composes the NebiusCluster XR, waits for it to
+        be ready, then wires its secrets into the backend.
+
+        The mk8s kubeconfig carries only the cluster endpoint and CA
+        certificate - Nebius authenticates every client through Nebius IAM -
+        so the ClusterProviderConfig authenticates as the Nebius service
+        account identity relayed through the NebiusCluster's status (the
+        Nebius ClusterProviderConfig's credentials Secret)
+        """
+        if not nebius:
+            response.warning(self.rsp, "Nebius configuration is required when source is Nebius")
+            return
+
+        self.compose_activation(_ACTIVATE_NEBIUS)
+        if self._activation_ready(_ACTIVATE_NEBIUS) or "nebius-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_nebius_cluster(nebius)
+
+        nebius_ready = (
+            resource.get_condition(self.req.observed.resources.get("nebius-cluster"), "Ready").status == "True"
+        )
+        kubeconfig = self.observed_nebius_secret(_SECRET_TYPE_KUBECONFIG)
+        credentials = self.observed_nebius_secret(_IDENTITY_TYPE_NEBIUS)
+        backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
+
+        if nebius_ready and kubeconfig:
+            self.compose_cluster_provider_config(
+                kubeconfig.name,
+                kubeconfig.key,
+                identity_ref=credentials,
+                identity_type=_IDENTITY_TYPE_NEBIUS,
+            )
+
+        backend_secrets = self.resolve_nebius_backend_secrets(nebius_ready=nebius_ready, backend_exists=backend_exists)
+        if backend_secrets or backend_exists:
+            if backend_secrets:
+                self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_NEBIUS)
+            self.compose_nebius_usage()
+
+        if nebius_ready:
+            self.rsp.desired.resources["nebius-cluster"].ready = fnv1.READY_TRUE
+            if not backend_exists:
+                response.normal(self.rsp, "Nebius cluster ready, composing backend")
+
+        self.write_status(self.gpu_pools())
+        self.derive_conditions(cluster_ready=nebius_ready)
+
+    def compose_vultr(self, vultr: v1alpha1.Vultr | None) -> None:
+        """Compose an InferenceCluster backed by a Modelplane-provisioned
+        VKE cluster. Composes the VultrCluster XR, waits for it to be ready,
+        then wires its kubeconfig into the backend.
+
+        The VKE kubeconfig embeds static client certificates, so
+        the kubeconfig alone is enough to reach the
+        cluster and no identity is layered on the ClusterProviderConfig.
+        """
+        if not vultr:
+            response.warning(self.rsp, "Vultr configuration is required when source is Vultr")
+            return
+
+        self.compose_activation(_ACTIVATE_VULTR)
+        if self._activation_ready(_ACTIVATE_VULTR) or "vultr-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_vultr_cluster(vultr)
+
+        vultr_ready = resource.get_condition(self.req.observed.resources.get("vultr-cluster"), "Ready").status == "True"
+        kubeconfig = self.observed_vultr_secret(_SECRET_TYPE_KUBECONFIG)
+        backend_exists = BACKEND_RESOURCE_KEY in self.req.observed.resources
+
+        if vultr_ready and kubeconfig:
+            self.compose_cluster_provider_config(kubeconfig.name, kubeconfig.key)
+
+        backend_secrets = self.resolve_vultr_backend_secrets(vultr_ready=vultr_ready, backend_exists=backend_exists)
+        if backend_secrets or backend_exists:
+            if backend_secrets:
+                self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_VULTR)
+            self.compose_vultr_usage()
+
+        if vultr_ready:
+            self.rsp.desired.resources["vultr-cluster"].ready = fnv1.READY_TRUE
+            if not backend_exists:
+                response.normal(self.rsp, "Vultr cluster ready, composing backend")
+
+        self.write_status(self.gpu_pools())
+        self.derive_conditions(cluster_ready=vultr_ready)
+
     def compose_existing(self, existing: v1alpha1.Existing | None) -> None:
         """Compose an InferenceCluster backed by a user-supplied cluster.
         No gating needed — the kubeconfig secret is provided by the user."""
@@ -322,16 +740,22 @@ class Composer:
 
         identity = existing.identitySecretRef
 
-        self.compose_cluster_provider_config(existing.secretRef.name, existing.secretRef.key, sa_key=identity)
+        self.compose_cluster_provider_config(
+            existing.secretRef.name,
+            existing.secretRef.key,
+            identity_ref=identity,
+            identity_type=(identity.type or _IDENTITY_TYPE_GCP) if identity else None,
+        )
 
         backend_secrets = [
             ssv1alpha1.Secret(type=_SECRET_TYPE_KUBECONFIG, name=existing.secretRef.name, key=existing.secretRef.key),
         ]
         if identity:
             backend_secrets.append(
-                ssv1alpha1.Secret(type=_SECRET_TYPE_GCP_SA_KEY, name=identity.name, key=identity.key),
+                # type defaults to GCP in the XRD; coalesce so it's never None.
+                ssv1alpha1.Secret(type=identity.type or _IDENTITY_TYPE_GCP, name=identity.name, key=identity.key),
             )
-        self.compose_serving_stack(backend_secrets)
+        self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_EXISTING)
 
         self.write_status(self.gpu_pools())
         self.derive_conditions(cluster_ready=True)
@@ -339,18 +763,31 @@ class Composer:
     def compose_serving_stack(
         self,
         backend_secrets: list[ssv1alpha1.Secret],
-        nvidia_driver_root: str | None = None,
+        cloud: Cloud,
     ) -> None:
         """Compose a ServingStack XR with the given secrets.
 
-        nvidia_driver_root is set for provisioned GKE clusters, where the NVIDIA
-        driver lives off the default / path; the serving stack consumes it
-        without inspecting its own cloud. Left None for EKS / existing clusters,
-        which keep the ServingStack's default root.
+        cloud names the cluster's source (this XR's spec.cluster.source)
+        and selects the component list the serving stack installs,
+        including cloud specifics like where the node image puts the
+        NVIDIA driver.
         """
-        spec = ssv1alpha1.Spec(secrets=backend_secrets)
-        if nvidia_driver_root is not None:
-            spec.nvidiaDriverRoot = nvidia_driver_root
+        # The gateway's name and the CAs it should accept client certificates
+        # from. The name is Modelplane's own, derived from this cluster's name;
+        # the CAs are from every InferenceGateway in the fleet, because any of
+        # them may forward here and each signs its client certificate with its
+        # own CA.
+        gateway = ssv1alpha1.Gateway(hostname=_gateway_hostname(_name(self.xr.metadata)))
+        if self.gateway_cas:
+            gateway.clientCAs = [
+                ssv1alpha1.ClientCA(name=name, certificate=cert) for name, cert in sorted(self.gateway_cas.items())
+            ]
+        spec = ssv1alpha1.Spec(
+            secrets=backend_secrets,
+            stack=self.xr.spec.stack,
+            cloud=cloud,
+            gateway=gateway,
+        )
         resource.update(
             self.rsp.desired.resources[BACKEND_RESOURCE_KEY],
             ssv1alpha1.ServingStack(
@@ -366,10 +803,20 @@ class Composer:
         self,
         kubeconfig_name: str,
         kubeconfig_key: str | None,
-        sa_key: gkev1alpha1.Secret | v1alpha1.IdentitySecretRef | None = None,
+        identity_ref: gkev1alpha1.Secret | nebiusv1alpha1.Secret | v1alpha1.IdentitySecretRef | None = None,
+        identity_type: str | None = None,
     ) -> None:
         """Compose a ClusterProviderConfig for provider-kubernetes so that
-        ModelReplicas can create Objects on the remote cluster."""
+        ModelReplicas can create Objects on the remote cluster.
+
+        When identity_ref is set, the ProviderConfig authenticates as the given
+        identity_type (the cloud IAM identity) on top of the kubeconfig instead
+        of relying on the kubeconfig's embedded credentials. The identity
+        secret is in modelplane-system unless the ref carries a namespace: the
+        Nebius credential is reused from the Secret the cluster-scoped Nebius
+        ClusterProviderConfig references, so its ref names that Secret's
+        namespace explicitly.
+        """
         cpc = k8scpcv1alpha1.ClusterProviderConfig(
             metadata=metav1.ObjectMeta(name=resource.child_name(_name(self.xr.metadata), "cluster-kubeconfig")),
             spec=k8scpcv1alpha1.Spec(
@@ -383,14 +830,14 @@ class Composer:
                 ),
             ),
         )
-        if sa_key:
+        if identity_ref:
             cpc.spec.identity = k8scpcv1alpha1.Identity(
-                type=_IDENTITY_TYPE_GCP,
+                type=identity_type,  # ty: ignore[invalid-argument-type]  # value comes from the XRD/GKE identity-type enums
                 source="Secret",
                 secretRef=k8scpcv1alpha1.SecretRef(
-                    namespace=_NAMESPACE_SYSTEM,
-                    name=sa_key.name,
-                    key=sa_key.key,  # ty: ignore[invalid-argument-type]  # XRD defaults the secret key
+                    namespace=getattr(identity_ref, "namespace", None) or _NAMESPACE_SYSTEM,
+                    name=identity_ref.name,
+                    key=identity_ref.key,  # ty: ignore[invalid-argument-type]  # XRD defaults the secret key
                 ),
             )
         resource.update(
@@ -406,7 +853,7 @@ class Composer:
                 name=resource.child_name(_name(self.xr.metadata), "cluster-kubeconfig"),
             ),
             namespace=_NAMESPACE_SYSTEM,
-            gpuPools=gpu_pools,  # ty: ignore[invalid-argument-type]  # gpu_pools builds the by-alias wire form; pydantic coerces it to GpuPool
+            gpuPools=gpu_pools,  # gpu_pools builds the by-alias wire form; pydantic coerces it to GpuPool
         )
         cache_storage_class = self.observed_cache_storage_class()
         if cache_storage_class:
@@ -414,6 +861,32 @@ class Composer:
         gateway_address = self.observed_gateway_address()
         if gateway_address:
             status.gateway = v1alpha1.Gateway(address=gateway_address)
+            # Republished from the ServingStack so an InferenceGateway can
+            # validate this cluster's gateway without reading a ServingStack,
+            # which is machine-generated and not something another composition
+            # should depend on the shape of.
+            ca = self.observed_gateway_ca()
+            if ca:
+                status.gateway.caCertificate = ca
+            # The hostname is what makes this cluster schedulable, so it is
+            # published only once traffic to it is mutually authenticated in
+            # both directions. That needs three things:
+            #
+            # An address, because an InferenceGateway addresses this cluster by
+            # name, so publishing a name that resolves to nothing strands every
+            # request routed to it.
+            #
+            # This cluster's CA, so an InferenceGateway can tell it reached this
+            # cluster rather than whatever else answers on that address.
+            #
+            # At least one InferenceGateway CA, because the cluster gateway only
+            # demands a client certificate when it has one to check against, and
+            # a cluster gateway with nothing to trust serves nothing (see the
+            # serving stack's serves_gateway). Publishing the hostname anyway
+            # would make the cluster schedulable when it has no front door, so
+            # every request routed to it would be stranded.
+            if ca and self.gateway_cas:
+                status.gateway.hostname = _gateway_hostname(_name(self.xr.metadata))
         resource.update_status(self.rsp.desired.composite, status)
 
     def derive_conditions(self, *, cluster_ready: bool) -> None:
@@ -452,9 +925,10 @@ class Composer:
     def compose_gke_cluster(self, gke: v1alpha1.Gke) -> None:
         """Compose a GKECluster XR.
 
-        Combines the cluster-level config (project, region) with the
-        GPU pools derived from the user's node pools + referenced classes.
-        The system pool is injected by compose-gke-cluster.
+        Combines the cluster-level config (region) with the GPU pools derived
+        from the user's node pools + referenced classes. The project is derived
+        by compose-gke-cluster from the referenced ProviderConfig. The system
+        pool is injected by compose-gke-cluster.
         """
         gke_node_pools: list[gkev1alpha1.NodePool] = []
 
@@ -491,6 +965,16 @@ class Composer:
                 )
             )
 
+        gke_spec = gkev1alpha1.Spec(
+            region=gke.region,
+            kubernetesVersion=gke.kubernetesVersion,
+            nodePools=gke_node_pools,
+        )
+        if gke.credentials:
+            gke_spec.credentials = gkev1alpha1.Credentials(
+                type=gke.credentials.type,
+                name=gke.credentials.name,
+            )
         resource.update(
             self.rsp.desired.resources["gke-cluster"],
             gkev1alpha1.GKECluster(
@@ -498,12 +982,7 @@ class Composer:
                     name=_name(self.xr.metadata),
                     namespace=_NAMESPACE_SYSTEM,
                 ),
-                spec=gkev1alpha1.Spec(
-                    project=gke.project,
-                    region=gke.region,
-                    kubernetesVersion=gke.kubernetesVersion,
-                    nodePools=gke_node_pools,
-                ),
+                spec=gke_spec,
             ),
         )
 
@@ -554,10 +1033,20 @@ class Composer:
                 )
             # Likewise only set fabric when the pool opts into one, so an
             # on-demand pool's EKSCluster spec stays free of fabric: None.
-            if pool.fabric and pool.fabric != "None":
-                node_pool.fabric = pool.fabric
+            if pool.fabric and pool.fabric.type == "EFA":
+                node_pool.fabric = pool.fabric.type
             eks_node_pools.append(node_pool)
 
+        eks_spec = eksv1alpha1.Spec(
+            region=eks.region,
+            kubernetesVersion=eks.kubernetesVersion,
+            nodePools=eks_node_pools,
+        )
+        if eks.credentials:
+            eks_spec.credentials = eksv1alpha1.Credentials(
+                type=eks.credentials.type,
+                name=eks.credentials.name,
+            )
         resource.update(
             self.rsp.desired.resources["eks-cluster"],
             eksv1alpha1.EKSCluster(
@@ -565,13 +1054,364 @@ class Composer:
                     name=_name(self.xr.metadata),
                     namespace=_NAMESPACE_SYSTEM,
                 ),
-                spec=eksv1alpha1.Spec(
-                    region=eks.region,
-                    kubernetesVersion=eks.kubernetesVersion,
-                    nodePools=eks_node_pools,
+                spec=eks_spec,
+            ),
+        )
+
+    def compose_aks_cluster(self, aks: v1alpha1.Aks) -> None:
+        """Compose an AKSCluster XR.
+
+        Combines the cluster-level config (location) with GPU node pools
+        derived from the user's node pools + referenced classes. The
+        system pool is injected by compose-aks-cluster.
+        """
+        aks_node_pools: list[aksv1alpha1.NodePool] = []
+
+        for pool in self.xr.spec.nodePools or []:
+            cls = self.classes.get(pool.className)
+            if not cls or not cls.spec.provisioning or not cls.spec.provisioning.aks:
+                msg = f"InferenceClass {pool.className} has no AKS provisioning block"
+                response.set_conditions(
+                    self.rsp,
+                    resource.Condition(
+                        typ=CONDITION_TYPE_CLUSTER_READY,
+                        status="False",
+                        reason=CONDITION_REASON_INVALID_NODE_POOL,
+                        message=msg,
+                    ),
+                )
+                response.warning(self.rsp, msg)
+                return
+            prov = cls.spec.provisioning.aks
+            node_pool = aksv1alpha1.NodePool(
+                name=pool.name,
+                role="GPU",
+                vmSize=prov.vmSize,
+                diskSizeGb=prov.diskSizeGb,
+                nodeCount=pool.nodeCount,
+                minNodeCount=pool.minNodeCount,
+                maxNodeCount=pool.maxNodeCount,
+                gpu=aksv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                ),
+            )
+            # Only set zones when the pool names some: the AKSCluster XRD
+            # requires a non-empty list, and many GPU VM sizes aren't zonal.
+            if pool.zones:
+                node_pool.zones = [aksv1alpha1.Zone(z) for z in pool.zones]
+            # Only set fabric when the pool opts into one, so an on-demand
+            # pool's AKSCluster spec stays free of fabric: None. Azure has no
+            # user-selectable fabric identifier - a pool's VM Scale Set
+            # placement group lands its nodes on one physical fabric - so any
+            # infiniband block is ignored here.
+            if pool.fabric and pool.fabric.type == "InfiniBand":
+                node_pool.fabric = pool.fabric.type
+            aks_node_pools.append(node_pool)
+
+        aks_spec = aksv1alpha1.Spec(
+            location=aks.location,
+            kubernetesVersion=aks.kubernetesVersion,
+            nodePools=aks_node_pools,
+        )
+        if aks.credentials:
+            aks_spec.credentials = aksv1alpha1.Credentials(
+                type=aks.credentials.type,
+                name=aks.credentials.name,
+            )
+        resource.update(
+            self.rsp.desired.resources["aks-cluster"],
+            aksv1alpha1.AKSCluster(
+                metadata=metav1.ObjectMeta(
+                    name=_name(self.xr.metadata),
+                    namespace=_NAMESPACE_SYSTEM,
+                ),
+                spec=aks_spec,
+            ),
+        )
+
+    def compose_nebius_cluster(self, nebius: v1alpha1.Nebius) -> None:
+        """Compose a NebiusCluster XR.
+
+        Combines the cluster-level config (project, credentials) with GPU
+        node pools derived from the user's node pools + referenced classes.
+        The system pool is injected by compose-nebius-cluster.
+        """
+        nebius_node_pools: list[nebiusv1alpha1.NodePool] = []
+
+        for pool in self.xr.spec.nodePools or []:
+            cls = self.classes.get(pool.className)
+            if not cls or not cls.spec.provisioning or not cls.spec.provisioning.nebius:
+                msg = f"InferenceClass {pool.className} has no Nebius provisioning block"
+                response.set_conditions(
+                    self.rsp,
+                    resource.Condition(
+                        typ=CONDITION_TYPE_CLUSTER_READY,
+                        status="False",
+                        reason=CONDITION_REASON_INVALID_NODE_POOL,
+                        message=msg,
+                    ),
+                )
+                response.warning(self.rsp, msg)
+                return
+            prov = cls.spec.provisioning.nebius
+            node_pool = nebiusv1alpha1.NodePool(
+                name=pool.name,
+                role="GPU",
+                platform=prov.platform,
+                preset=prov.preset,
+                diskSizeGb=prov.diskSizeGb,
+                nodeCount=pool.nodeCount,
+                gpu=nebiusv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                    driversPreset=prov.driversPreset,
+                ),
+            )
+            # mk8s node groups are either fixed size or autoscaled, never
+            # both. Only set the autoscaling bounds when the pool opts in, so
+            # fixed-size pools stay fixed (resource.update serializes with
+            # exclude_unset, keeping unset bounds out of the NebiusCluster
+            # spec rather than emitting maxNodeCount: null).
+            if pool.maxNodeCount is not None:
+                node_pool.maxNodeCount = pool.maxNodeCount
+            if pool.minNodeCount is not None:
+                node_pool.minNodeCount = pool.minNodeCount
+            # Likewise only set fabric when the pool opts into one. The XRD
+            # guarantees fabric.infiniband is set when fabric.type is
+            # InfiniBand; the fabric names the physical Nebius fabric the
+            # NebiusCluster composes a GPU cluster on.
+            if pool.fabric and pool.fabric.type == "InfiniBand" and pool.fabric.infiniband:
+                node_pool.fabric = nebiusv1alpha1.Fabric(
+                    type="InfiniBand",
+                    infiniband=nebiusv1alpha1.Infiniband(fabric=pool.fabric.infiniband.fabric),
+                )
+            nebius_node_pools.append(node_pool)
+
+        spec = nebiusv1alpha1.Spec(
+            kubernetesVersion=nebius.kubernetesVersion,
+            nodePools=nebius_node_pools,
+        )
+        if nebius.credentials:
+            spec.credentials = nebiusv1alpha1.Credentials(
+                type=nebius.credentials.type,
+                name=nebius.credentials.name,
+            )
+        resource.update(
+            self.rsp.desired.resources["nebius-cluster"],
+            nebiusv1alpha1.NebiusCluster(
+                metadata=metav1.ObjectMeta(
+                    name=_name(self.xr.metadata),
+                    namespace=_NAMESPACE_SYSTEM,
+                ),
+                spec=spec,
+            ),
+        )
+
+    def compose_nebius_usage(self) -> None:
+        """Block NebiusCluster deletion until the backend is deleted."""
+        resource.update(
+            self.rsp.desired.resources["usage-nebius-by-backend"],
+            usagev1beta1.Usage(
+                metadata=metav1.ObjectMeta(namespace=_NAMESPACE_SYSTEM),
+                spec=usagev1beta1.Spec(
+                    of=usagev1beta1.Of(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="NebiusCluster",
+                        resourceSelector=usagev1beta1.ResourceSelectorModel(matchControllerRef=True),
+                    ),
+                    by=usagev1beta1.By(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="ServingStack",
+                        resourceSelector=usagev1beta1.ResourceSelector(matchControllerRef=True),
+                    ),
+                    replayDeletion=True,
                 ),
             ),
         )
+        self.rsp.desired.resources["usage-nebius-by-backend"].ready = fnv1.READY_TRUE
+
+    def resolve_nebius_backend_secrets(
+        self, *, nebius_ready: bool, backend_exists: bool
+    ) -> list[ssv1alpha1.Secret] | None:
+        """Resolve secrets for the backend from NebiusCluster status. Falls
+        back to the observed backend's spec.secrets if NebiusCluster secrets
+        aren't available but the backend already exists. Entries keep their
+        namespace when set - the Nebius credential is reused from the Secret
+        the Nebius ClusterProviderConfig references, outside
+        modelplane-system."""
+        nebius_secrets = self.observed_nebius_secrets()
+
+        if nebius_ready and nebius_secrets:
+            secrets = []
+            for s in nebius_secrets:
+                secret = ssv1alpha1.Secret(
+                    type=s.type, name=s.name, key=s.key
+                )  # values come from the XRD secret-type enums
+                # Only set namespace when the entry carries one, so entries in
+                # the backend's own namespace stay namespace-free.
+                if s.namespace:
+                    secret.namespace = s.namespace
+                secrets.append(secret)
+            return secrets
+
+        if backend_exists:
+            observed = self.req.observed.resources.get(BACKEND_RESOURCE_KEY)
+            if observed:
+                d = resource.struct_to_dict(observed.resource)
+                observed_secrets = d.get("spec", {}).get("secrets", [])
+                if observed_secrets:
+                    secrets = []
+                    for s in observed_secrets:
+                        secret = ssv1alpha1.Secret(type=s["type"], name=s["name"], key=s["key"])
+                        if s.get("namespace"):
+                            secret.namespace = s["namespace"]
+                        secrets.append(secret)
+                    return secrets
+
+        return None
+
+    def observed_nebius_secrets(self) -> list[nebiusv1alpha1.Secret] | None:
+        """Read the NebiusCluster's status.secrets from observed state."""
+        nebius_observed = self.req.observed.resources.get("nebius-cluster")
+        if not nebius_observed:
+            return None
+        observed_nebius = nebiusv1alpha1.NebiusCluster.model_validate(resource.struct_to_dict(nebius_observed.resource))
+        if not observed_nebius.status:
+            return None
+        return observed_nebius.status.secrets
+
+    def observed_nebius_secret(self, secret_type: str) -> nebiusv1alpha1.Secret | None:
+        """Read a specific secret from the observed NebiusCluster status."""
+        nebius_secrets = self.observed_nebius_secrets()
+        if not nebius_secrets:
+            return None
+        return next((s for s in nebius_secrets if s.type == secret_type), None)
+
+    def compose_vultr_cluster(self, vultr: v1alpha1.Vultr) -> None:
+        """Compose a VultrCluster XR.
+
+        Combines the cluster-level config (region) with GPU node pools
+        derived from the user's node pools + referenced classes. The
+        system pool is injected by compose-vultr-cluster.
+        """
+        vultr_node_pools: list[vultrv1alpha1.NodePool] = []
+
+        for pool in self.xr.spec.nodePools or []:
+            cls = self.classes.get(pool.className)
+            if not cls or not cls.spec.provisioning or not cls.spec.provisioning.vultr:
+                msg = f"InferenceClass {pool.className} has no Vultr provisioning block"
+                response.set_conditions(
+                    self.rsp,
+                    resource.Condition(
+                        typ=CONDITION_TYPE_CLUSTER_READY,
+                        status="False",
+                        reason=CONDITION_REASON_INVALID_NODE_POOL,
+                        message=msg,
+                    ),
+                )
+                response.warning(self.rsp, msg)
+                return
+            prov = cls.spec.provisioning.vultr
+            node_pool = vultrv1alpha1.NodePool(
+                name=pool.name,
+                role="GPU",
+                plan=prov.plan,
+                nodeCount=pool.nodeCount,
+                gpu=vultrv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                ),
+            )
+            # Only set the autoscaling bounds when the pool opts in, so
+            # fixed-size pools stay fixed (resource.update serializes with
+            # exclude_unset, keeping unset bounds out of the VultrCluster
+            # spec rather than emitting maxNodeCount: null). Fabric is not
+            # mapped: VKE has no EFA or InfiniBand analog yet.
+            if pool.maxNodeCount is not None:
+                node_pool.maxNodeCount = pool.maxNodeCount
+            if pool.minNodeCount is not None:
+                node_pool.minNodeCount = pool.minNodeCount
+            vultr_node_pools.append(node_pool)
+
+        vultr_spec = vultrv1alpha1.Spec(
+            region=vultr.region,
+            kubernetesVersion=vultr.kubernetesVersion,
+            nodePools=vultr_node_pools,
+        )
+        if vultr.credentials:
+            vultr_spec.credentials = vultrv1alpha1.Credentials(
+                type=vultr.credentials.type,
+                name=vultr.credentials.name,
+            )
+        resource.update(
+            self.rsp.desired.resources["vultr-cluster"],
+            vultrv1alpha1.VultrCluster(
+                metadata=metav1.ObjectMeta(
+                    name=_name(self.xr.metadata),
+                    namespace=_NAMESPACE_SYSTEM,
+                ),
+                spec=vultr_spec,
+            ),
+        )
+
+    def compose_vultr_usage(self) -> None:
+        """Block VultrCluster deletion until the backend is deleted."""
+        resource.update(
+            self.rsp.desired.resources["usage-vultr-by-backend"],
+            usagev1beta1.Usage(
+                metadata=metav1.ObjectMeta(namespace=_NAMESPACE_SYSTEM),
+                spec=usagev1beta1.Spec(
+                    of=usagev1beta1.Of(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="VultrCluster",
+                        resourceSelector=usagev1beta1.ResourceSelectorModel(matchControllerRef=True),
+                    ),
+                    by=usagev1beta1.By(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="ServingStack",
+                        resourceSelector=usagev1beta1.ResourceSelector(matchControllerRef=True),
+                    ),
+                    replayDeletion=True,
+                ),
+            ),
+        )
+        self.rsp.desired.resources["usage-vultr-by-backend"].ready = fnv1.READY_TRUE
+
+    def resolve_vultr_backend_secrets(
+        self, *, vultr_ready: bool, backend_exists: bool
+    ) -> list[ssv1alpha1.Secret] | None:
+        """Resolve secrets for the backend from VultrCluster status. Falls
+        back to the observed backend's spec.secrets if VultrCluster secrets
+        aren't available but the backend already exists."""
+        vultr_secrets = self.observed_vultr_secrets()
+
+        if vultr_ready and vultr_secrets:
+            return [ssv1alpha1.Secret(type=s.type, name=s.name, key=s.key) for s in vultr_secrets]
+
+        if backend_exists:
+            observed = self.req.observed.resources.get(BACKEND_RESOURCE_KEY)
+            if observed:
+                d = resource.struct_to_dict(observed.resource)
+                observed_secrets = d.get("spec", {}).get("secrets", [])
+                if observed_secrets:
+                    return [ssv1alpha1.Secret(type=s["type"], name=s["name"], key=s["key"]) for s in observed_secrets]
+
+        return None
+
+    def observed_vultr_secrets(self) -> list[vultrv1alpha1.Secret] | None:
+        """Read the VultrCluster's status.secrets from observed state."""
+        vultr_observed = self.req.observed.resources.get("vultr-cluster")
+        if not vultr_observed:
+            return None
+        observed_vultr = vultrv1alpha1.VultrCluster.model_validate(resource.struct_to_dict(vultr_observed.resource))
+        if not observed_vultr.status:
+            return None
+        return observed_vultr.status.secrets
+
+    def observed_vultr_secret(self, secret_type: str) -> vultrv1alpha1.Secret | None:
+        """Read a specific secret from the observed VultrCluster status."""
+        vultr_secrets = self.observed_vultr_secrets()
+        if not vultr_secrets:
+            return None
+        return next((s for s in vultr_secrets if s.type == secret_type), None)
 
     def compose_eks_usage(self) -> None:
         """Block EKSCluster deletion until the backend is deleted."""
@@ -631,6 +1471,65 @@ class Composer:
         if not eks_secrets:
             return None
         return next((s for s in eks_secrets if s.type == secret_type), None)
+
+    def compose_aks_usage(self) -> None:
+        """Block AKSCluster deletion until the backend is deleted."""
+        resource.update(
+            self.rsp.desired.resources["usage-aks-by-backend"],
+            usagev1beta1.Usage(
+                metadata=metav1.ObjectMeta(namespace=_NAMESPACE_SYSTEM),
+                spec=usagev1beta1.Spec(
+                    of=usagev1beta1.Of(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="AKSCluster",
+                        resourceSelector=usagev1beta1.ResourceSelectorModel(matchControllerRef=True),
+                    ),
+                    by=usagev1beta1.By(
+                        apiVersion="infrastructure.modelplane.ai/v1alpha1",
+                        kind="ServingStack",
+                        resourceSelector=usagev1beta1.ResourceSelector(matchControllerRef=True),
+                    ),
+                    replayDeletion=True,
+                ),
+            ),
+        )
+        self.rsp.desired.resources["usage-aks-by-backend"].ready = fnv1.READY_TRUE
+
+    def resolve_aks_backend_secrets(self, *, aks_ready: bool, backend_exists: bool) -> list[ssv1alpha1.Secret] | None:
+        """Resolve secrets for the backend from AKSCluster status. Falls
+        back to the observed backend's spec.secrets if AKSCluster secrets
+        aren't available but the backend already exists."""
+        aks_secrets = self.observed_aks_secrets()
+
+        if aks_ready and aks_secrets:
+            return [ssv1alpha1.Secret(type=s.type, name=s.name, key=s.key) for s in aks_secrets]
+
+        if backend_exists:
+            observed = self.req.observed.resources.get(BACKEND_RESOURCE_KEY)
+            if observed:
+                d = resource.struct_to_dict(observed.resource)
+                observed_secrets = d.get("spec", {}).get("secrets", [])
+                if observed_secrets:
+                    return [ssv1alpha1.Secret(type=s["type"], name=s["name"], key=s["key"]) for s in observed_secrets]
+
+        return None
+
+    def observed_aks_secrets(self) -> list[aksv1alpha1.Secret] | None:
+        """Read the AKSCluster's status.secrets from observed state."""
+        aks_observed = self.req.observed.resources.get("aks-cluster")
+        if not aks_observed:
+            return None
+        observed_aks = aksv1alpha1.AKSCluster.model_validate(resource.struct_to_dict(aks_observed.resource))
+        if not observed_aks.status:
+            return None
+        return observed_aks.status.secrets
+
+    def observed_aks_secret(self, secret_type: str) -> aksv1alpha1.Secret | None:
+        """Read a specific secret from the observed AKSCluster status."""
+        aks_secrets = self.observed_aks_secrets()
+        if not aks_secrets:
+            return None
+        return next((s for s in aks_secrets if s.type == secret_type), None)
 
     def compose_gke_usage(self) -> None:
         """Block GKECluster deletion until the backend is deleted."""
@@ -719,6 +1618,19 @@ class Composer:
             return None
         return next((s for s in gke_secrets if s.type == secret_type), None)
 
+    def observed_gateway_ca(self) -> str | None:
+        """The cluster gateway's CA certificate, from the observed backend.
+
+        Read by dict rather than through a typed model, matching
+        observed_gateway_address, so it works for any backend following the
+        status.gateway contract.
+        """
+        observed = self.req.observed.resources.get(BACKEND_RESOURCE_KEY)
+        if not observed:
+            return None
+        d = resource.struct_to_dict(observed.resource)
+        return d.get("status", {}).get("gateway", {}).get("caCertificate")
+
     def observed_gateway_address(self) -> str | None:
         """Read the backend's gateway address from observed state.
         Uses dict access instead of a typed model so it works for any
@@ -733,21 +1645,32 @@ class Composer:
         """The effective ModelCache RWX StorageClass name, relayed up so
         ModelCache can target it without reaching into the cluster XRs.
 
-        For provisioned (GKE/EKS) clusters it comes from the backing cluster's
+        For provisioned clusters it comes from the backing cluster's
         status.cache.storageClassName, which reports the Modelplane-managed
-        class. For Existing clusters there is no cluster XR, so it's the
+        class. Vultr is absent: VultrCluster composes no cache StorageClass.
+        For Existing clusters there is no cluster XR, so it's the
         user-supplied name. None until the cluster XR reports it."""
+        provisioned = {
+            CLUSTER_SOURCE_GKE: ("gke-cluster", gkev1alpha1.GKECluster),
+            CLUSTER_SOURCE_EKS: ("eks-cluster", eksv1alpha1.EKSCluster),
+            CLUSTER_SOURCE_AKS: ("aks-cluster", aksv1alpha1.AKSCluster),
+            CLUSTER_SOURCE_NEBIUS: ("nebius-cluster", nebiusv1alpha1.NebiusCluster),
+        }
         cluster = self.xr.spec.cluster
-        if cluster.source == CLUSTER_SOURCE_GKE:
-            return self._observed_cluster_cache_class("gke-cluster", gkev1alpha1.GKECluster)
-        if cluster.source == CLUSTER_SOURCE_EKS:
-            return self._observed_cluster_cache_class("eks-cluster", eksv1alpha1.EKSCluster)
+        if cluster.source in provisioned:
+            key, model = provisioned[cluster.source]
+            return self._observed_cluster_cache_class(key, model)
         if cluster.source == CLUSTER_SOURCE_EXISTING and cluster.existing and cluster.existing.cache:
             return cluster.existing.cache.storageClassName
         return None
 
     def _observed_cluster_cache_class(
-        self, key: str, model: type[gkev1alpha1.GKECluster] | type[eksv1alpha1.EKSCluster]
+        self,
+        key: str,
+        model: type[gkev1alpha1.GKECluster]
+        | type[eksv1alpha1.EKSCluster]
+        | type[aksv1alpha1.AKSCluster]
+        | type[nebiusv1alpha1.NebiusCluster],
     ) -> str | None:
         """Read status.cache.storageClassName from an observed cluster XR."""
         observed = self.req.observed.resources.get(key)

@@ -73,24 +73,21 @@ let
       '';
 in
 {
-  # Verify the docs site builds. The build is the check.
-  docs = docs.site;
-
-  # Lint docs prose with Vale.
+  # Lint docs prose with Vale. The site that renders this content is the
+  # docs-site repo, which builds and link-checks it where it deploys.
   docs-vale = docs.vale;
-
-  # Check docs internal links with htmltest.
-  docs-htmltest = docs.htmltest;
 
   # Validate the example manifests the docs show against the generated Pydantic
   # models, so an example that drifts from the live API schema fails CI. Covers
   # everything under docs/manifests/, including the API-reference examples under
-  # docs/manifests/reference/. Reuses compose-inference-gateway's venv, which
-  # already provides crossplane-models, pydantic, and pyyaml.
+  # docs/manifests/reference/. The venv names what the validator imports:
+  # crossplane-models, pyyaml and pydantic.
   docs-manifests =
     let
       venv = pythonSet.mkVirtualEnv "docs-manifests-validate-env" {
-        compose-inference-gateway = [ ];
+        crossplane-models = [ ];
+        pyyaml = [ ];
+        pydantic = [ ];
       };
     in
     pkgs.runCommand "modelplane-docs-manifests" { } ''
@@ -117,6 +114,34 @@ in
         touch $out/.python-checks-passed
       '';
 
+  # Fail if the generated serving stack lists are stale: regenerate them
+  # from the embedded catalog with the pinned aicr (fully offline - the
+  # recipes resolve from the catalog the binary embeds) and diff against
+  # what's checked in. Catches a generator change committed without
+  # `nix run .#stacks`, a hand-edit to a generated file, and any
+  # non-determinism in the pipeline.
+  stacks-current =
+    pkgs.runCommand "modelplane-stacks-current"
+      {
+        nativeBuildInputs = [
+          pkgs.aicr
+          (pkgs.python312.withPackages (ps: [ ps.pyyaml ]))
+          pkgs.unstable.ruff
+        ];
+      }
+      ''
+        cp -r ${self} src
+        chmod -R u+w src
+        cd src
+        export HOME=$TMPDIR
+        python3 functions/compose-serving-stack/generate.py
+        ruff format functions/compose-serving-stack/function/stacks/clouds/generated/
+        diff -ru ${self}/functions/compose-serving-stack/function/stacks/clouds/generated \
+          functions/compose-serving-stack/function/stacks/clouds/generated
+        mkdir -p $out
+        touch $out/.stacks-current
+      '';
+
   # Fail if any hand-written source file is missing its Apache 2.0 license
   # header. Scoped to the files we author: the composition functions and the
   # docs manifest validator. Generated models under schemas/python carry their
@@ -134,7 +159,7 @@ in
           -ignore '**/*.toml' \
           -ignore '**/*.yaml' \
           -ignore '**/*.yml' \
-          functions/ docs/utils/validate/ nix.sh docs/vercel-build.sh
+          functions/ docs/utils/validate/ nix.sh
         mkdir -p $out
         touch $out/.license-check-passed
       '';
@@ -164,7 +189,7 @@ in
         nativeBuildInputs = [
           pkgs.statix
           pkgs.deadnix
-          pkgs.nixfmt-rfc-style
+          pkgs.nixfmt
         ];
       }
       ''

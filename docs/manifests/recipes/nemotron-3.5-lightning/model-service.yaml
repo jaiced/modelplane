@@ -1,0 +1,16 @@
+# Name the model, ml-team/nemotron-lightning, in
+# an OpenAI request to an InferenceGateway that serves it, e.g.:
+#   ADDR=$(kubectl get ig public -o jsonpath='{.status.endpoints.openAI}')
+#   curl "$ADDR/chat/completions" -H 'Content-Type: application/json' \
+#     -d '{"model":"ml-team/nemotron-lightning","messages":[{"role":"user","content":"hello"}]}'
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelService
+metadata:
+  name: nemotron-lightning
+  namespace: ml-team
+spec:
+  endpoints:
+  - name: nemotron-lightning
+    selector:
+      matchLabels:
+        modelplane.ai/deployment: nemotron-lightning

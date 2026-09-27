@@ -174,18 +174,23 @@ _AUTH_SELECTOR = fnv1.ResourceSelector(
     namespace="ml-team",
 )
 
-# The hydration shell script the Job runs (no revision, no auth secret).
+# The hydration shell script the Job runs (no revision, no auth secret). No
+# --local-dir: HF_HUB_CACHE (below) points `hf download` at the mount, so it
+# stages in HuggingFace's cache layout and a serving pod can load by repo id.
 _HYDRATE_CMD = (
     "set -e; if [ -f /mnt/artifact/.modelplane-hydrated ]; then echo 'already hydrated, skipping'; exit 0; fi; "
-    "pip install --quiet huggingface_hub; hf download Qwen/Qwen3-0.6B --local-dir /mnt/artifact; "
+    "pip install --quiet huggingface_hub; hf download Qwen/Qwen3-0.6B; "
     "touch /mnt/artifact/.modelplane-hydrated"
 )
 # With a pinned revision (case 2 wires --revision and the HF_TOKEN env).
 _HYDRATE_CMD_REVISION = (
     "set -e; if [ -f /mnt/artifact/.modelplane-hydrated ]; then echo 'already hydrated, skipping'; exit 0; fi; "
-    "pip install --quiet huggingface_hub; hf download Qwen/Qwen3-0.6B --revision main --local-dir /mnt/artifact; "
+    "pip install --quiet huggingface_hub; hf download Qwen/Qwen3-0.6B --revision main; "
     "touch /mnt/artifact/.modelplane-hydrated"
 )
+# Set on the hydration Job so `hf download` writes the hub cache layout into
+# the mount rather than the container's default ~/.cache.
+_HYDRATE_CACHE_ENV = {"name": "HF_HUB_CACHE", "value": "/mnt/artifact"}
 
 _PVC_NAME = "modelcache-ml-team-qwen-17db2"
 _JOB_NAME = "modelcache-ml-team-qwen-hydrate-256ec"
@@ -206,7 +211,7 @@ def _pvc_object(pc: str, *, storage_class: str = "modelplane-rwx") -> dict:
                 "manifest": {
                     "apiVersion": "v1",
                     "kind": "PersistentVolumeClaim",
-                    "metadata": {"name": _PVC_NAME, "namespace": "default", "labels": _LABELS},
+                    "metadata": {"name": _PVC_NAME, "namespace": "mp-ml-team-51733", "labels": _LABELS},
                     "spec": {
                         "accessModes": ["ReadWriteMany"],
                         "resources": {"requests": {"storage": "20Gi"}},
@@ -221,6 +226,9 @@ def _pvc_object(pc: str, *, storage_class: str = "modelplane-rwx") -> dict:
 
 
 def _job_object(pc: str, *, command: str = _HYDRATE_CMD, env: list | None = None) -> dict:
+    # HF_HUB_CACHE leads the Job's env on every source; anything the caller
+    # passes (an authSecret's HF_TOKEN) follows it.
+    env = [_HYDRATE_CACHE_ENV, *(env or [])]
     return {
         "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
         "kind": "Object",
@@ -229,7 +237,7 @@ def _job_object(pc: str, *, command: str = _HYDRATE_CMD, env: list | None = None
                 "manifest": {
                     "apiVersion": "batch/v1",
                     "kind": "Job",
-                    "metadata": {"name": _JOB_NAME, "namespace": "default", "labels": _LABELS},
+                    "metadata": {"name": _JOB_NAME, "namespace": "mp-ml-team-51733", "labels": _LABELS},
                     "spec": {
                         "backoffLimit": 3,
                         "ttlSecondsAfterFinished": 180,
@@ -242,7 +250,7 @@ def _job_object(pc: str, *, command: str = _HYDRATE_CMD, env: list | None = None
                                         "name": "hydrate",
                                         "image": "python:3.11-slim",
                                         "command": ["/bin/sh", "-c", command],
-                                        "env": env or [],
+                                        "env": env,
                                         "volumeMounts": [{"name": "artifact", "mountPath": "/mnt/artifact"}],
                                     },
                                 ],
@@ -275,7 +283,7 @@ def _auth_object(pc: str) -> dict:
                 "manifest": {
                     "apiVersion": "v1",
                     "kind": "Secret",
-                    "metadata": {"name": _AUTH_NAME, "namespace": "default", "labels": _LABELS},
+                    "metadata": {"name": _AUTH_NAME, "namespace": "mp-ml-team-51733", "labels": _LABELS},
                     "data": {"HF_TOKEN": _TOKEN_B64},
                 },
             },
